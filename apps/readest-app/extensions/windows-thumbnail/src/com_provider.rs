@@ -6,7 +6,7 @@
 /// **Important**: Thumbnails are only shown when Readest.exe is the default application
 /// for the file type.
 ///
-/// ## CLSID: {A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
+/// ## CLSID: {D2C86420-833F-4E4E-B727-6DDC1079BC00}
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -39,8 +39,8 @@ use super::cached_thumbnail_for_path;
 // CLSID for Readest Thumbnail Provider
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// CLSID: {A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
-pub const CLSID_READEST_THUMBNAIL: GUID = GUID::from_u128(0xA1B2C3D4_E5F6_7890_ABCD_EF1234567890);
+/// CLSID: {D2C86420-833F-4E4E-B727-6DDC1079BC00}
+pub const CLSID_READEST_THUMBNAIL: GUID = GUID::from_u128(0xD2C86420_833F_4E4E_B727_6DDC1079BC00);
 
 /// Supported file extensions
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
