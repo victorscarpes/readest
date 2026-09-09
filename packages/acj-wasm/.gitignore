@@ -1,0 +1,3 @@
+# Build scratch — the committed artifact is dist/acj.js only.
+build/
+test/.verify-*
