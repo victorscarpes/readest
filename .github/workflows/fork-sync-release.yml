@@ -1,0 +1,265 @@
+name: Fork sync + release
+
+# Rebase this fork's arithmetic-JPEG patch onto the latest upstream release,
+# build a Windows installer, and publish a matching fork release with a signed
+# updater manifest. The maintainer is only pinged (a "Fork sync failed" issue +
+# GitHub's own failed-run email) when something needs a human: the patch won't
+# apply, an apply-overrides.mjs anchor moved, or lint / tests / build fail.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Upstream tag/ref to build (default: their latest release)'
+        required: false
+      release_tag:
+        description: "Fork release tag (default: same as upstream). Use e.g. v0.12.8-test1 to test auto-update."
+        required: false
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-sync-release
+  cancel-in-progress: false
+
+env:
+  FORK_REPO: victorscarpes/readest
+  UPSTREAM_REPO: readest/readest
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      upstream_ref: ${{ steps.decide.outputs.upstream_ref }}
+      release_tag: ${{ steps.decide.outputs.release_tag }}
+    steps:
+      - name: Decide whether there is anything to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_REF: ${{ github.event.inputs.upstream_ref }}
+          IN_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          UP_TAG=$(gh release view --repo "$UPSTREAM_REPO" --json tagName -q .tagName)
+          echo "upstream latest release: $UP_TAG"
+          FORK_TAG=$(gh release view --repo "$FORK_REPO" --json tagName -q .tagName 2>/dev/null || echo "")
+          echo "fork latest release:     ${FORK_TAG:-<none>}"
+
+          UPSTREAM_REF="${IN_REF:-$UP_TAG}"
+          RELEASE_TAG="${IN_TAG:-$UPSTREAM_REF}"
+
+          if [ -n "$IN_REF" ] || [ -n "$IN_TAG" ]; then
+            BUILD=true                       # manual dispatch always builds
+          elif [ "$UP_TAG" != "$FORK_TAG" ]; then
+            BUILD=true
+          else
+            BUILD=false
+          fi
+          echo "-> build=$BUILD  upstream_ref=$UPSTREAM_REF  release_tag=$RELEASE_TAG"
+          {
+            echo "build=$BUILD"
+            echo "upstream_ref=$UPSTREAM_REF"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash # every run: step uses bash so $VAR / heredocs behave (windows-latest defaults to pwsh)
+    outputs:
+      applied: ${{ steps.apply.outcome }}
+      lint: ${{ steps.lint.outcome }}
+      test: ${{ steps.test.outcome }}
+    env:
+      UPSTREAM_REF: ${{ needs.check.outputs.upstream_ref }}
+      RELEASE_TAG: ${{ needs.check.outputs.release_tag }}
+      GH_TOKEN: ${{ github.token }}
+      HUSKY: 0 # the repo's git hooks run the full test suite on push; the bot runs lint/tests itself
+    steps:
+      - name: Checkout fork main (carries fork/ + this workflow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+          token: ${{ secrets.FORK_PAT || github.token }}
+
+      - name: Configure git
+        run: |
+          # Runners default to autocrlf=true; keep everything LF so the binary
+          # feature patch applies and biome/tsc see the same bytes as locally.
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          git config --global core.longpaths true
+          git config core.autocrlf false
+          git config core.eol lf
+          git config core.longpaths true
+          git config user.name "fork-sync[bot]"
+          git config user.email "fork-sync@users.noreply.github.com"
+          # The initial checkout ran with autocrlf=true; re-materialise the tree
+          # with LF now, otherwise every text file looks "modified" and the next
+          # `git checkout` refuses to run.
+          git reset --hard -q HEAD
+
+      - name: Rebuild main from fork-base + the upstream ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAIN_SHA=$(git rev-parse HEAD)
+          echo "MAIN_SHA=$MAIN_SHA" >> "$GITHUB_ENV"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "+refs/tags/${UPSTREAM_REF}:refs/fork-upstream" \
+            || git fetch --no-tags upstream "${UPSTREAM_REF}:refs/fork-upstream"
+          # fork-base is a PERMANENT commit (fork/ + this one workflow, other
+          # upstream workflows removed). We only ever rebuild the 3 commits on
+          # top of it, and none of them touch .github/workflows/ — so the
+          # force-push needs only `contents: write`, no PAT.
+          git fetch origin '+refs/tags/fork-base:refs/tags/fork-base'
+          git checkout -B "sync/${RELEASE_TAG}" fork-base
+          git clean -ffdx
+          # Materialise the upstream tree, but keep fork-base's fork/ + workflows
+          # (fork/apply-overrides.mjs and this workflow are maintained ONLY on
+          #  the fork-base commit; the bot just consumes them).
+          git read-tree -u --reset refs/fork-upstream
+          rm -rf .github/workflows fork
+          # fork-base owns: fork/, this workflow, and the fork's README.
+          git checkout fork-base -- fork .github/workflows README.md
+          git add -A
+          git commit --allow-empty -q -m "fork: upstream ${UPSTREAM_REF}"
+
+      - name: Apply the arithmetic-JPEG patch (new files only)
+        id: apply
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --3way --whitespace=nowarn fork/patches/*.patch
+          git add -A
+          git commit -m "fork: arithmetic-JPEG feature" -q
+
+      - name: Init submodules (needs the packages/tauri fork)
+        run: git submodule update --init --recursive --depth 1
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # Cache the cargo registry + target dir so runs after the first compile
+      # the vendored Tauri fork in minutes instead of ~30. Keyed on the upstream
+      # ref + the Cargo lockfiles.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/readest-app/src-tauri
+          key: ${{ env.UPSTREAM_REF }}
+          cache-on-failure: true
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare vendored web assets
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: Apply fork overrides (identity + updater endpoints/pubkey + reader hook)
+        id: overrides
+        run: node fork/apply-overrides.mjs
+
+      - name: Stamp the app version to match the release tag
+        run: |
+          set -euo pipefail
+          # Upstream bumps package.json in a commit AFTER cutting the tag, so the
+          # tag tree can carry an older version. Pin it to the release so the
+          # installer name and latest.json version line up.
+          VER="${RELEASE_TAG#v}"
+          node -e "const f='apps/readest-app/package.json',p=require('./'+f);p.version=process.argv[1];require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')" "$VER"
+          echo "app version -> $VER"
+
+      - name: Commit the applied state
+        run: |
+          set -euo pipefail
+          git add -A
+          git commit -m "fork: identity + updater + reader hook + v${RELEASE_TAG#v} (${UPSTREAM_REF})" -q
+
+      - name: Lint (tsc + biome)
+        id: lint
+        run: pnpm --filter @readest/readest-app lint
+
+      - name: Arithmetic-JPEG tests
+        id: test
+        run: pnpm --filter @readest/readest-app exec vitest run src/__tests__/services/acj
+
+      - name: Fast-forward fork main to the built state
+        shell: bash
+        run: |
+          set -euo pipefail
+          # main must carry this commit before a release can target it.
+          # (Pushing changes under .github/workflows/ needs a PAT with `workflows`
+          #  scope — secrets.FORK_PAT; the default GITHUB_TOKEN cannot.)
+          git push --no-verify origin "HEAD:refs/heads/main" --force-with-lease=main:"$MAIN_SHA"
+
+      - name: Create draft release on the fork
+        id: draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES=$(gh release view "$UPSTREAM_REF" --repo "$UPSTREAM_REPO" --json body -q .body || echo "")
+          BODY=$(printf '%s\n\n---\n\nRebased fork of [%s@%s](https://github.com/%s/releases/tag/%s) with lossless arithmetic-coded JPEG support.\nUnsigned installer — Windows SmartScreen will warn on first run; auto-update afterwards is verified by the fork'\''s own key.\n' \
+            "$NOTES" "$UPSTREAM_REPO" "$UPSTREAM_REF" "$UPSTREAM_REPO" "$UPSTREAM_REF")
+          # Clear a same-tag release/tag left by a previous failed attempt.
+          gh release delete "$RELEASE_TAG" --repo "$FORK_REPO" --yes --cleanup-tag 2>/dev/null || true
+          git push origin ":refs/tags/${RELEASE_TAG}" 2>/dev/null || true
+          gh release create "$RELEASE_TAG" --repo "$FORK_REPO" --title "Readest (victorscarpes) ${RELEASE_TAG}" \
+            --notes "$BODY" --draft --target main
+          echo "id=$(gh release view "$RELEASE_TAG" --repo "$FORK_REPO" --json databaseId -q .databaseId)" >> "$GITHUB_OUTPUT"
+
+      - name: Build + sign + upload the Windows installer and updater manifest
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        with:
+          projectPath: apps/readest-app
+          tauriScript: pnpm tauri
+          releaseId: ${{ steps.draft.outputs.id }}
+          args: --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Attach release-notes.json (READEST_CHANGELOG_FILE resolves to it)
+        run: gh release upload "$RELEASE_TAG" --repo "$FORK_REPO" apps/readest-app/release-notes.json --clobber
+
+      - name: Publish the release
+        run: gh release edit "$RELEASE_TAG" --repo "$FORK_REPO" --draft=false --latest
+
+  notify:
+    needs: [check, build]
+    if: always() && (needs.check.result == 'failure' || needs.build.result == 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open / update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          RUN="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          TITLE="Fork sync failed: ${TAG:-unknown}"
+          BODY=$(printf 'The scheduled fork sync failed.\n\n- upstream ref: %s\n- run: %s\n\nLikely causes: an anchor in \`fork/apply-overrides.mjs\` moved (upstream refactored the reader hook or a constant), the patch no longer applies, or lint/tests/build broke. Fix on \`main\`, then re-run the workflow.' \
+            "${{ needs.check.outputs.upstream_ref }}" "$RUN")
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number -q '.[0].number' || echo "")
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" \
+              --assignee victorscarpes --label "fork-sync" 2>/dev/null \
+            || gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" --assignee victorscarpes
+          fi
