@@ -1,0 +1,8 @@
+# The Tauri updater signing keys. The private key + its password live only in
+# the fork repo's GitHub Actions secrets (TAURI_SIGNING_PRIVATE_KEY /
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD) and in the maintainer's password manager.
+# NEVER commit these. The public key is in config.json and that is enough for
+# the tree.
+updater.key
+updater.key.pub
+*.key

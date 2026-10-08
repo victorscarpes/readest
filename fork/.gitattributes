@@ -1,0 +1,8 @@
+# The feature patch carries base85 binary hunks (JPEG fixtures, the wasm module).
+# It must be applied byte-for-byte — never let core.autocrlf touch it on any
+# checkout (CI runners default to autocrlf=true).
+patches/*.patch -text
+
+# The overlay script + config run under Node on Linux and Windows runners.
+apply-overrides.mjs text eol=lf
+config.json text eol=lf
