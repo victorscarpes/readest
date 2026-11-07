@@ -212,13 +212,17 @@ jobs:
         run: |
           set -euo pipefail
           NOTES=$(gh release view "$UPSTREAM_REF" --repo "$UPSTREAM_REPO" --json body -q .body || echo "")
-          BODY=$(printf '%s\n\n---\n\nRebased fork of [%s@%s](https://github.com/%s/releases/tag/%s) with lossless arithmetic-coded JPEG support.\nUnsigned installer — Windows SmartScreen will warn on first run; auto-update afterwards is verified by the fork'\''s own key.\n' \
-            "$NOTES" "$UPSTREAM_REPO" "$UPSTREAM_REF" "$UPSTREAM_REPO" "$UPSTREAM_REF")
+          # A long upstream changelog can exceed the OS argv length limit (hit
+          # on windows-latest at ~39KB) if passed inline via --notes, so write
+          # it to a file and use --notes-file instead.
+          BODY_FILE="$RUNNER_TEMP/release-notes-body.md"
+          printf '%s\n\n---\n\nRebased fork of [%s@%s](https://github.com/%s/releases/tag/%s) with lossless arithmetic-coded JPEG support.\nUnsigned installer — Windows SmartScreen will warn on first run; auto-update afterwards is verified by the fork'\''s own key.\n' \
+            "$NOTES" "$UPSTREAM_REPO" "$UPSTREAM_REF" "$UPSTREAM_REPO" "$UPSTREAM_REF" > "$BODY_FILE"
           # Clear a same-tag release/tag left by a previous failed attempt.
           gh release delete "$RELEASE_TAG" --repo "$FORK_REPO" --yes --cleanup-tag 2>/dev/null || true
           git push origin ":refs/tags/${RELEASE_TAG}" 2>/dev/null || true
           gh release create "$RELEASE_TAG" --repo "$FORK_REPO" --title "Readest (victorscarpes) ${RELEASE_TAG}" \
-            --notes "$BODY" --draft --target main
+            --notes-file "$BODY_FILE" --draft --target main
           echo "id=$(gh release view "$RELEASE_TAG" --repo "$FORK_REPO" --json databaseId -q .databaseId)" >> "$GITHUB_OUTPUT"
 
       - name: Build + sign + upload the Windows installer and updater manifest
