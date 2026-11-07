@@ -22,10 +22,12 @@ import { useBookshelfDate } from '@/hooks/useBookshelfDate';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { navigateToLibrary, navigateToReader, showReaderWindow } from '@/utils/nav';
 import {
+  canRemoveFromDeviceOnly,
   createBookFilter,
   createBookSorter,
   ensureLibraryGroupByType,
   expandBookshelfSelection,
+  getCommonGroupName,
   findSelectedManualGroup,
   resolveCurrentShelfBooks,
   selectAbsOfflineBooks,
@@ -59,6 +61,7 @@ import ModalPortal from '@/components/ModalPortal';
 import BookshelfItem from './BookshelfItem';
 import SelectModeActions from './SelectModeActions';
 import ShareBookDialog from './ShareBookDialog';
+import { createCollectionPack, READEST_PACK_MIME } from '@/services/pack/packService';
 import { useAuth } from '@/context/AuthContext';
 import GroupingModal from './GroupingModal';
 import TaggingModal from './TaggingModal';
@@ -85,6 +88,7 @@ interface BookshelfProps {
   handleBookUpload: (book: Book, syncBooks?: boolean) => Promise<boolean>;
   handleBookDelete: (book: Book, syncBooks?: boolean) => Promise<boolean>;
   handleBookPurge: (book: Book, syncBooks?: boolean) => Promise<boolean>;
+  handleBookDeleteLocalCopy: (book: Book, syncBooks?: boolean) => Promise<boolean>;
   handleSetSelectMode: (selectMode: boolean) => void;
   handleShowDetailsBook: (book: Book) => void;
   handleLibraryNavigation: (targetGroup: string, shelfId?: string) => void;
@@ -109,6 +113,7 @@ const Bookshelf: React.FC<BookshelfProps> = ({
   handleBookDownload,
   handleBookDelete,
   handleBookPurge,
+  handleBookDeleteLocalCopy,
   handleSetSelectMode,
   handleShowDetailsBook,
   handleLibraryNavigation,
@@ -197,7 +202,8 @@ const Bookshelf: React.FC<BookshelfProps> = ({
   const [tagBookHashes, setTagBookHashes] = useState<string[] | null>(null);
   const [importBookUrl] = useState(searchParams?.get('url') || '');
 
-  const abortDeletionRef = useRef(false);
+  // Bumped by each deletion run and by Cancel; a run stops once it is stale.
+  const deletionRunRef = useRef(0);
   const selectAllAppliedRef = useRef(false);
   const isImportingBook = useRef(false);
   const iconSize15 = useResponsiveSize(15);
@@ -488,27 +494,36 @@ const Bookshelf: React.FC<BookshelfProps> = ({
     return filteredBooks.filter((book) => wanted.has(book.hash) && !book.deletedAt);
   };
 
-  const confirmDelete = async (purgeData: boolean) => {
-    const books = getBooksToDelete();
-    // Toggling "purge all reading data" on the confirmation routes the whole
-    // batch through the purge path, which also wipes each book's reading-data
-    // sidecars (config/nav) instead of leaving the metadata folder behind.
-    const deleteBook = purgeData ? handleBookPurge : handleBookDelete;
+  const runDeletion = async (
+    books: Book[],
+    deleteBook: (book: Book, syncBooks?: boolean) => Promise<boolean>,
+  ) => {
+    const run = ++deletionRunRef.current;
     const concurrency = 20;
 
-    for (let i = 0; i < books.length; i += concurrency) {
-      if (abortDeletionRef.current) {
-        abortDeletionRef.current = false;
-        break;
-      }
+    for (let i = 0; i < books.length && run === deletionRunRef.current; i += concurrency) {
       const batch = books.slice(i, i + concurrency);
       await Promise.all(batch.map((book) => deleteBook(book, false)));
     }
     handlePushLibrary();
+    // Cancel already closed this run's alert, and a newer run owns the one
+    // that may be open now.
+    if (run !== deletionRunRef.current) return;
     setSelectedBooks([]);
     setShowDeleteAlert(false);
     setShowSelectModeActions(true);
   };
+
+  // Toggling "purge all reading data" on the confirmation routes the whole
+  // batch through the purge path, which also wipes each book's reading-data
+  // sidecars (config/nav) instead of leaving the metadata folder behind.
+  const confirmDelete = (purgeData: boolean) =>
+    runDeletion(getBooksToDelete(), purgeData ? handleBookPurge : handleBookDelete);
+
+  // "Remove from Device Only" (#7318) skips the selected books that would be
+  // left with no copy anywhere, or that have nothing on this device.
+  const confirmDeleteLocalCopies = () =>
+    runDeletion(getBooksToDelete().filter(canRemoveFromDeviceOnly), handleBookDeleteLocalCopy);
 
   const deleteSelectedBooks = () => {
     // Expand any group ids in the selection into the book hashes they
@@ -644,16 +659,81 @@ const Bookshelf: React.FC<BookshelfProps> = ({
   };
 
   const sendSelectedNearby = () => {
-    // Group ids in the selection simply don't match any book hash and drop
-    // out; LocalSendManager resolves the files and reports unavailable books.
-    const ids = getSelectedBooks();
+    const ids = expandBookshelfSelection(getSelectedBooks(), sortedBookshelfItems);
     const books = ids
       .map((id) => filteredBooks.find((book) => book.hash === id))
       .filter((book): book is Book => !!book);
     if (books.length === 0) return;
     setShowSelectModeActions(false);
     handleSetSelectMode(false);
-    eventDispatcher.dispatch('localsend-send-books', { books });
+
+    // Several books from one group travel as a .rbooks pack so the receiver
+    // restores the group; a single book is sent as itself.
+    const collectionName = books.length > 1 ? getCommonGroupName(books) : undefined;
+
+    eventDispatcher.dispatch('localsend-send-books', {
+      books,
+      asPack: !!collectionName,
+      collectionName,
+    });
+  };
+
+  const handlePackSelectedBooks = async () => {
+    if (!appService) return;
+    const ids = expandBookshelfSelection(getSelectedBooks(), sortedBookshelfItems);
+    const books = ids
+      .map((id) => filteredBooks.find((book) => book.hash === id))
+      .filter((book): book is Book => !!book);
+    if (books.length === 0) return;
+
+    setShowSelectModeActions(false);
+    handleSetSelectMode(false);
+
+    eventDispatcher.dispatch('toast', {
+      type: 'info',
+      message: _('Creating package for {{count}} book(s)...', { count: books.length }),
+      timeout: 3000,
+    });
+
+    try {
+      const result = await createCollectionPack(appService, books, getCommonGroupName(books));
+      if (!result) {
+        eventDispatcher.dispatch('toast', {
+          type: 'warning',
+          message: _('No local files available to pack'),
+          timeout: 3000,
+        });
+        return;
+      }
+
+      if (result.count < books.length) {
+        eventDispatcher.dispatch('toast', {
+          type: 'warning',
+          message: _('{{count}} book(s) omitted (file not available locally)', {
+            count: books.length - result.count,
+          }),
+          timeout: 4000,
+        });
+      }
+
+      const saved = await appService.saveFile(result.filename, result.data, {
+        mimeType: READEST_PACK_MIME,
+      });
+      if (!saved) return;
+
+      eventDispatcher.dispatch('toast', {
+        type: 'success',
+        message: _('Exported {{filename}}', { filename: result.filename }),
+        timeout: 3000,
+      });
+    } catch (err) {
+      console.error('Failed to create book pack:', err);
+      eventDispatcher.dispatch('toast', {
+        type: 'error',
+        message: _('Failed to export package'),
+        timeout: 3000,
+      });
+    }
   };
 
   const updateBooksStatus = async (status: ReadingStatus | undefined) => {
@@ -869,6 +949,7 @@ const Bookshelf: React.FC<BookshelfProps> = ({
         mode={mode}
         coverFit={shelf.coverFit || 'crop'}
         skeuomorphicCovers={shelf.skeuomorphicCovers}
+        showPageCount={shelf.showPageCount}
         isSelectMode={isSelectMode}
         itemSelected={
           'hash' in item
@@ -1035,6 +1116,7 @@ const Bookshelf: React.FC<BookshelfProps> = ({
           onStatus={showStatusSelection}
           onDownload={downloadSelectedBooks}
           onSend={sendSelectedBook}
+          onPack={handlePackSelectedBooks}
           onDelete={deleteSelectedBooks}
           onCancel={() => handleSetSelectMode(false)}
         />
@@ -1086,12 +1168,14 @@ const Bookshelf: React.FC<BookshelfProps> = ({
               count: getBooksToDelete().length,
             })}
             showPurgeToggle
+            deviceOnlyCount={getBooksToDelete().filter(canRemoveFromDeviceOnly).length}
             onCancel={() => {
-              abortDeletionRef.current = true;
+              deletionRunRef.current++;
               setShowDeleteAlert(false);
               setShowSelectModeActions(true);
             }}
             onConfirm={confirmDelete}
+            onConfirmDeviceOnly={confirmDeleteLocalCopies}
           />
         </div>
       )}

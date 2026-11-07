@@ -2,6 +2,12 @@ import type { Book } from '@/types/book';
 import type { BookshelfFieldKind, BookshelfOperator } from '@/types/bookshelf';
 import { stubTranslation as _ } from '@/utils/misc';
 
+// Defined here, not in utils/book.ts (which re-exports it): the replica sync
+// API route reaches this module, and utils/book.ts loads the document parsers
+// and language detection on every cold Worker start.
+export const getBookPageCount = (book: Book): number | undefined =>
+  book.progress?.[1] || book.pageCount || undefined;
+
 type FieldValue = string | number | boolean | string[] | undefined;
 export interface BookshelfField {
   id: string;
@@ -120,6 +126,7 @@ export const BOOKSHELF_FIELDS: BookshelfField[] = [
     read: (b) =>
       b.progress != null && !['unread', 'finished', 'abandoned'].includes(b.readingStatus || ''),
   },
+  { id: 'pages', label: _('Pages'), kind: 'number', read: (b) => getBookPageCount(b) },
   { id: 'created', label: _('Date Added'), kind: 'date', read: (b) => b.createdAt },
   // Date Read deliberately retains the library's existing updatedAt semantics.
   { id: 'updated', label: _('Date Read'), kind: 'date', read: (b) => b.updatedAt },

@@ -15,6 +15,7 @@ import { useTrafficLightStore } from '@/store/trafficLightStore';
 import { useTrafficLight } from '@/hooks/useTrafficLight';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { useSpatialNavigation } from '@/app/reader/hooks/useSpatialNavigation';
+import { useWindowFocusRestore } from '@/app/reader/hooks/useWindowFocusRestore';
 import { getHighlightColorHex } from '../utils/annotatorUtil';
 import { annotationToolQuickActions } from './annotator/AnnotationTools';
 import { AnnotationToolType } from '@/types/annotator';
@@ -31,6 +32,7 @@ import SidebarToggler from './SidebarToggler';
 import BookmarkToggler from './BookmarkToggler';
 import NotebookToggler from './NotebookToggler';
 import TranslationToggler from './TranslationToggler';
+import DuoBookModeToggler from './DuoBookModeToggler';
 import ViewMenu from './ViewMenu';
 import SyncInfoDialog from './SyncInfoDialog';
 
@@ -91,6 +93,7 @@ const HeaderBar: React.FC<HeaderBarProps> = ({
 
   const docs = view?.renderer.getContents() ?? [];
   const pointerInDoc = docs.some(({ doc }) => doc?.body?.style.cursor === 'pointer');
+  const isWindowFocusRestore = useWindowFocusRestore();
 
   const enableAnnotationQuickActions = viewSettings?.enableAnnotationQuickActions;
   const annotationQuickActionButton =
@@ -148,12 +151,14 @@ const HeaderBar: React.FC<HeaderBarProps> = ({
   }, []);
 
   // Check if mouse is outside header area to avoid false positive event of MouseLeave when clicking inside header on Windows
+  // The top edge itself counts as inside: a pointer pushed against the top of a
+  // maximized window sits at y=0 and can't leave upward (#7015).
   const isMouseOutsideHeader = useCallback((clientX: number, clientY: number) => {
     if (!headerRef.current) return true;
 
     const rect = headerRef.current.getBoundingClientRect();
     return (
-      clientX <= rect.left || clientX >= rect.right || clientY <= rect.top || clientY >= rect.bottom
+      clientX <= rect.left || clientX >= rect.right || clientY < rect.top || clientY >= rect.bottom
     );
   }, []);
 
@@ -206,6 +211,13 @@ const HeaderBar: React.FC<HeaderBarProps> = ({
         onClick={() => setHoveredBookKey(bookKey)}
         onMouseEnter={() => !appService?.isMobile && setHoveredBookKey(bookKey)}
         onTouchStart={() => !appService?.isMobile && setHoveredBookKey(bookKey)}
+        // A pointer that crosses the strip straight into the book never enters
+        // the header, so the header's own mouseleave never comes (#6999).
+        onMouseLeave={(e) => {
+          if (!appService?.isMobile && isMouseOutsideHeader(e.clientX, e.clientY)) {
+            setHoveredBookKey('');
+          }
+        }}
       />
       <div
         className={clsx(
@@ -239,7 +251,9 @@ const HeaderBar: React.FC<HeaderBarProps> = ({
           // (#6307); clear it without losing the header's own ps-4/pr-4 padding.
           ...getHorizontalInsetStyle(insets, isIPhoneDuo, 16),
         }}
-        onFocus={() => !appService?.isMobile && setHoveredBookKey(bookKey)}
+        onFocus={() =>
+          !appService?.isMobile && !isWindowFocusRestore() && setHoveredBookKey(bookKey)
+        }
         onMouseLeave={(e) => {
           if (!appService?.isMobile && isMouseOutsideHeader(e.clientX, e.clientY)) {
             setHoveredBookKey('');
@@ -257,10 +271,11 @@ const HeaderBar: React.FC<HeaderBarProps> = ({
               px-1.5 reserves the 6px each 44px halo extends past its 32px
               button, so the halos do not create a draggable scroll range. */}
           <div className='no-scrollbar flex h-full min-w-0 items-center gap-x-4 overflow-x-auto px-1.5 max-[350px]:gap-x-2'>
-            {/* Tablet portrait runs the mobile footer bar, whose TOC tab opens
-                this same sidebar — showing the toggle here too gave one action
-                two buttons (#5634). Phones are already covered by `sm:`. */}
-            {!isSideBarVisible && !forceMobileLayout && (
+            {/* Tablets keep the toggle top-left in every orientation, where
+                it sits on desktop, so it is not mistaken for Go to Library
+                (#7292). Phones are hidden by `sm:`; iPhone Duo keeps the
+                phone bars, whose TOC tab opens this sidebar (#5634). */}
+            {!isSideBarVisible && !(forceMobileLayout && isIPhoneDuo) && (
               <div className='hidden sm:flex'>
                 <SidebarToggler bookKey={bookKey} />
               </div>
@@ -274,6 +289,7 @@ const HeaderBar: React.FC<HeaderBarProps> = ({
             </button>
             <BookmarkToggler bookKey={bookKey} />
             <TranslationToggler bookKey={bookKey} />
+            <DuoBookModeToggler bookKey={bookKey} />
           </div>
           {enableAnnotationQuickActions && (
             <Dropdown
@@ -305,6 +321,7 @@ const HeaderBar: React.FC<HeaderBarProps> = ({
               onToggle={handleToggleDropdown}
             >
               <QuickActionMenu
+                bookKey={bookKey}
                 selectedAction={viewSettings.annotationQuickAction}
                 onActionSelect={handleAnnotationQuickActionSelect}
               />
