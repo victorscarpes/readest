@@ -4,7 +4,7 @@
 !include "LogicLib.nsh"
 
 ; CLSID for Readest Thumbnail Provider
-!define CLSID_READEST_THUMBNAIL "{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}"
+!define CLSID_READEST_THUMBNAIL "{D2C86420-833F-4E4E-B727-6DDC1079BC00}"
 
 ; IThumbnailProvider Shell Extension Handler GUID
 !define SHELL_THUMBNAIL_HANDLER "{e357fccd-a995-4576-b01f-234630154e96}"

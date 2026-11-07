@@ -96,6 +96,7 @@ import { getDirFromUILanguage } from '@/utils/rtl';
 import { isTauriAppPlatform } from '@/services/environment';
 import { TransformContext } from '@/services/transformers/types';
 import { transformContent } from '@/services/transformService';
+import { maybeTranscodeArithmeticJpeg } from '@/services/acj';
 import {
   getSectionDocumentType,
   normalizeMediaType,
@@ -1002,9 +1003,32 @@ const FoliateViewer: React.FC<{
       const handleTransformData = getDocTransformHandler({ width, height });
       book.transformTarget?.addEventListener('load', handleTransformLoad);
       book.transformTarget?.addEventListener('data', handleTransformData);
+      // Arithmetic-coded JPEGs (SOF9/10) are valid JPEG but no webview
+      // decodes them. Losslessly transcode to baseline Huffman here, before
+      // foliate turns the bytes into a blob: URL. Runs after
+      // handleTransformData, which passes image resources through untouched.
+      const handleAcjTransformData = (event: Event) => {
+        const { detail } = event as CustomEvent<{ data: unknown; type: string; name?: string }>;
+        if (detail.type !== 'image/jpeg') return;
+        const original = detail.data;
+        detail.data = Promise.resolve(original)
+          .then((data) =>
+            maybeTranscodeArithmeticJpeg(
+              data instanceof Blob ? data : new Blob([data as BlobPart], { type: 'image/jpeg' }),
+            ),
+          )
+          .catch((e) => {
+            console.error(
+              new Error(`ACJ transform failed for ${detail.name ?? '?'}`, { cause: e }),
+            );
+            return original;
+          });
+      };
+      book.transformTarget?.addEventListener('data', handleAcjTransformData);
       removeTransformListenersRef.current = () => {
         book.transformTarget?.removeEventListener('load', handleTransformLoad);
         book.transformTarget?.removeEventListener('data', handleTransformData);
+        book.transformTarget?.removeEventListener('data', handleAcjTransformData);
       };
       // The reader can close while view.open() is pending; its cleanup has run.
       if (unmountedRef.current) removeTransformListenersRef.current();
