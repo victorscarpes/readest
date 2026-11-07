@@ -108,16 +108,23 @@ edit('src/app/reader/components/FoliateViewer.tsx', (s) => {
   }
 
   if (!o.includes('maybeTranscodeArithmeticJpeg(')) {
-    const anchor =
-      "book.transformTarget?.addEventListener('data', getDocTransformHandler({ width, height }));";
-    if (!o.includes(anchor)) throw new Error('listener anchor (getDocTransformHandler) not found');
+    const anchor = [
+      "      book.transformTarget?.addEventListener('load', handleTransformLoad);",
+      "      book.transformTarget?.addEventListener('data', handleTransformData);",
+      '      removeTransformListenersRef.current = () => {',
+      "        book.transformTarget?.removeEventListener('load', handleTransformLoad);",
+      "        book.transformTarget?.removeEventListener('data', handleTransformData);",
+      '      };',
+    ].join('\n');
+    if (!o.includes(anchor)) throw new Error('listener anchor (transformTarget listener wiring) not found');
     const block = [
-      anchor,
+      "      book.transformTarget?.addEventListener('load', handleTransformLoad);",
+      "      book.transformTarget?.addEventListener('data', handleTransformData);",
       '      // Arithmetic-coded JPEGs (SOF9/10) are valid JPEG but no webview',
       '      // decodes them. Losslessly transcode to baseline Huffman here, before',
       '      // foliate turns the bytes into a blob: URL. Runs after',
-      '      // getDocTransformHandler, which passes image resources through untouched.',
-      "      book.transformTarget?.addEventListener('data', (event: Event) => {",
+      '      // handleTransformData, which passes image resources through untouched.',
+      "      const handleAcjTransformData = (event: Event) => {",
       '        const { detail } = event as CustomEvent<{ data: unknown; type: string; name?: string }>;',
       "        if (detail.type !== 'image/jpeg') return;",
       '        const original = detail.data;',
@@ -131,7 +138,13 @@ edit('src/app/reader/components/FoliateViewer.tsx', (s) => {
       "            console.error(new Error(`ACJ transform failed for ${detail.name ?? '?'}`, { cause: e }));",
       '            return original;',
       '          });',
-      '      });',
+      '      };',
+      "      book.transformTarget?.addEventListener('data', handleAcjTransformData);",
+      '      removeTransformListenersRef.current = () => {',
+      "        book.transformTarget?.removeEventListener('load', handleTransformLoad);",
+      "        book.transformTarget?.removeEventListener('data', handleTransformData);",
+      "        book.transformTarget?.removeEventListener('data', handleAcjTransformData);",
+      '      };',
     ].join('\n');
     o = o.replace(anchor, block);
   }
