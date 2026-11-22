@@ -517,6 +517,76 @@ export const extendSelectionFromContents = (
   return false;
 };
 
+// Vim visual-mode motions (#7281): move the selection's moving end (its focus)
+// the way vim moves the cursor. Directions are logical, so RTL text follows.
+type Direction = 'forward' | 'backward';
+const VIM_MOTIONS: Record<string, [Direction, string]> = {
+  h: ['backward', 'character'],
+  l: ['forward', 'character'],
+  b: ['backward', 'word'],
+  j: ['forward', 'line'],
+  k: ['backward', 'line'],
+  $: ['forward', 'lineboundary'],
+  '(': ['backward', 'sentence'],
+  ')': ['forward', 'sentence'],
+};
+
+const isSpaceAtFocus = (sel: Selection, dir: Direction) => {
+  const node = sel.focusNode;
+  if (node?.nodeType !== Node.TEXT_NODE) return false;
+  const text = node.textContent ?? '';
+  const ch = dir === 'forward' ? text[sel.focusOffset] : text[sel.focusOffset - 1];
+  return !!ch && /\s/.test(ch);
+};
+
+const skipSpaces = (sel: Selection, dir: Direction) => {
+  while (isSpaceAtFocus(sel, dir)) {
+    const { focusNode, focusOffset } = sel;
+    sel.modify('extend', dir, 'character');
+    if (sel.focusNode === focusNode && sel.focusOffset === focusOffset) return;
+  }
+};
+
+export const applyVimMotion = (sel: Selection, key: string): boolean => {
+  if (key === 'o') {
+    const { anchorNode, anchorOffset, focusNode, focusOffset } = sel;
+    if (!anchorNode || !focusNode) return false;
+    sel.setBaseAndExtent(focusNode, focusOffset, anchorNode, anchorOffset);
+  } else if (key === 'w') {
+    // Start of the next word. A forward word step lands on the word's end on
+    // macOS and past the next space on Windows; skipping spaces evens them out.
+    if (!isSpaceAtFocus(sel, 'forward')) sel.modify('extend', 'forward', 'word');
+    skipSpaces(sel, 'forward');
+  } else if (key === 'e') {
+    // End of the next word, without the space Windows' word step takes along.
+    skipSpaces(sel, 'forward');
+    sel.modify('extend', 'forward', 'word');
+    skipSpaces(sel, 'backward');
+  } else if (key === '}') {
+    // End of the paragraph, then the next one on a repeat. Chromium's
+    // `paragraph` step keeps the caret's x like a line step, so step over the
+    // edge and go to the boundary instead.
+    sel.modify('extend', 'forward', 'character');
+    sel.modify('extend', 'forward', 'paragraphboundary');
+  } else if (key === '0' || key === '{') {
+    // Start of the line, or of the paragraph (the one before on a repeat).
+    // Chromium won't extend a forward selection back to a boundary, so move a
+    // collapsed caret there and re-extend from the anchor.
+    const { anchorNode, anchorOffset, focusNode } = sel;
+    if (!anchorNode || !focusNode) return false;
+    sel.collapse(focusNode, sel.focusOffset);
+    if (key === '{') sel.modify('move', 'backward', 'character');
+    sel.modify('move', 'backward', key === '0' ? 'lineboundary' : 'paragraphboundary');
+    if (!sel.focusNode) return false;
+    sel.setBaseAndExtent(anchorNode, anchorOffset, sel.focusNode, sel.focusOffset);
+  } else {
+    const motion = VIM_MOTIONS[key];
+    if (!motion) return false;
+    sel.modify('extend', motion[0], motion[1]);
+  }
+  return true;
+};
+
 export const snapRangeToWords = (range: Range): void => {
   if (typeof Intl === 'undefined' || !Intl.Segmenter) return;
 
@@ -717,6 +787,68 @@ export const trimRangeWhitespaceAroundPoint = (
   if (!start || !end) return false;
   range.setStart(start.node, start.offset);
   range.setEnd(end.node, end.offset);
+  return true;
+};
+
+// A footnote marker right after a word joins it in a native word selection
+// (letters followed by digits make one word), so a double-click or long-press
+// on "fox¹" picked "fox1" (#6803). Markers are a noteref link or a superscript
+// or link holding only a marker, as Read Aloud skips them.
+const NOTE_MARKER_TEXT = /^\s*[[(]?[*\d\u2020\u2021\u00a7]+[)\]]?\s*$/;
+
+const isNoteMarker = (el: Element): boolean => {
+  if (!NOTE_MARKER_TEXT.test(el.textContent ?? '')) return false;
+  const type = el.getAttribute('epub:type') ?? '';
+  return (
+    el.localName === 'sup' ||
+    (el.localName === 'a' && el.hasAttribute('href')) ||
+    /\bnoteref\b/.test(type) ||
+    el.getAttribute('role') === 'doc-noteref'
+  );
+};
+
+const outermostNoteMarker = (node: Node): Element | null => {
+  let marker: Element | null = null;
+  for (
+    let el = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+    el;
+    el = el.parentElement
+  ) {
+    if (isNoteMarker(el)) marker = el;
+    else if (marker) break;
+  }
+  return marker;
+};
+
+const markerAtBoundary = (container: Node, offset: number, side: 'start' | 'end') => {
+  if (container.nodeType === Node.ELEMENT_NODE) {
+    const child = container.childNodes[side === 'end' ? offset - 1 : offset];
+    return child?.nodeType === Node.ELEMENT_NODE && isNoteMarker(child as Element)
+      ? (child as Element)
+      : null;
+  }
+  return outermostNoteMarker(container);
+};
+
+// Drop a footnote marker from either end of a word selection. Only for a
+// captured Range snapshot (see trimRangeWhitespaceAroundPoint); a selection
+// that is nothing but the marker is left as it is.
+export const trimNoteMarkersFromWordRange = (range: Range): boolean => {
+  const trimmed = range.cloneRange();
+  let changed = false;
+  const endMarker = markerAtBoundary(range.endContainer, range.endOffset, 'end');
+  if (endMarker && !endMarker.contains(range.startContainer)) {
+    trimmed.setEndBefore(endMarker);
+    changed = true;
+  }
+  const startMarker = markerAtBoundary(range.startContainer, range.startOffset, 'start');
+  if (startMarker && !startMarker.contains(range.endContainer)) {
+    trimmed.setStartAfter(startMarker);
+    changed = true;
+  }
+  if (!changed || trimmed.collapsed || !trimmed.toString().trim()) return false;
+  range.setStart(trimmed.startContainer, trimmed.startOffset);
+  range.setEnd(trimmed.endContainer, trimmed.endOffset);
   return true;
 };
 
@@ -1004,3 +1136,108 @@ export const getTextFromRange = (range: Range, rejectTags: string[] = []): strin
 
   return text;
 };
+
+const BLOCK_DISPLAY = /^(block|flex|grid|flow-root|list-item|table)/;
+
+export interface TextRun {
+  text: string;
+  bold: boolean;
+  italic: boolean;
+}
+
+const isBoldWeight = (weight: string) =>
+  weight === 'bold' || weight === 'bolder' || Number.parseInt(weight, 10) >= 600;
+
+// The selection as the reader sees it, for quote cards (#5830), as runs of
+// bold / italic text: whitespace collapsed the way CSS does, nodes hidden with
+// display: none (a toggled-off translation) and ruby annotations skipped, and a
+// line break at each block boundary or <br>. getTextFromRange keeps raw
+// text-node values, whose source-formatting newlines would read as paragraph
+// breaks.
+export const getRenderedRunsFromRange = (range: Range): TextRun[] => {
+  const doc = range.startContainer.ownerDocument;
+  const win = doc?.defaultView;
+  if (!doc || !win || getPdfTextLayer(range)) {
+    return [{ text: getTextFromRange(range, ['rt']), bold: false, italic: false }];
+  }
+
+  const styleOf = (el: Element) => win.getComputedStyle(el);
+  const blockOf = (node: Node) => {
+    let el = node.parentElement;
+    while (el && !BLOCK_DISPLAY.test(styleOf(el).display)) el = el.parentElement;
+    return el;
+  };
+
+  const runs: TextRun[] = [];
+  let text = '';
+  const append = (value: string, bold: boolean, italic: boolean) => {
+    if (!value) return;
+    text += value;
+    const last = runs.at(-1);
+    if (last && last.bold === bold && last.italic === italic) last.text += value;
+    else runs.push({ text: value, bold, italic });
+  };
+  const lineBreak = () => {
+    const last = runs.at(-1);
+    if (!last) return;
+    const trimmed = last.text.trimEnd();
+    text = text.slice(0, text.length - (last.text.length - trimmed.length)) + '\n';
+    last.text = `${trimmed}\n`;
+  };
+
+  let lastBlock: Element | null | undefined;
+  const addText = (node: Text) => {
+    const parent = node.parentElement;
+    const style = parent ? styleOf(parent) : null;
+    if (style?.visibility === 'hidden') return;
+    const raw = node.nodeValue ?? '';
+    const start = node === range.startContainer ? range.startOffset : 0;
+    const end = node === range.endContainer ? range.endOffset : raw.length;
+    let value = raw.slice(start, end);
+    const block = blockOf(node);
+    if (lastBlock !== undefined && block !== lastBlock && text && !text.endsWith('\n')) {
+      lineBreak();
+    }
+    lastBlock = block;
+    if (!parent?.closest('pre') && !style?.whiteSpace.startsWith('pre')) {
+      value = value.replace(/[\t\n\r ]+/g, ' ');
+      if (!text || /[ \n]$/.test(text)) value = value.replace(/^ /, '');
+    }
+    append(
+      value,
+      !!style && isBoldWeight(style.fontWeight),
+      !!style && /italic|oblique/.test(style.fontStyle),
+    );
+  };
+
+  const root = range.commonAncestorContainer;
+  if (root.nodeType === Node.TEXT_NODE) {
+    addText(root as Text);
+    return runs;
+  }
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => {
+      if (!range.intersectsNode(node)) return NodeFilter.FILTER_REJECT;
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node as Element;
+        if (/^(rt|rp)$/i.test(el.tagName) || styleOf(el).display === 'none') {
+          return NodeFilter.FILTER_REJECT;
+        }
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (node.nodeType === Node.TEXT_NODE) addText(node as Text);
+    else if ((node as Element).tagName.toLowerCase() === 'br') {
+      const last = runs.at(-1);
+      append('\n', last?.bold ?? false, last?.italic ?? false);
+    }
+  }
+  return runs;
+};
+
+export const getRenderedTextFromRange = (range: Range): string =>
+  getRenderedRunsFromRange(range)
+    .map((run) => run.text)
+    .join('');

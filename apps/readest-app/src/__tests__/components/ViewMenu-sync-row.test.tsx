@@ -79,6 +79,9 @@ vi.mock('@/hooks/useCloudSyncStatus', () => ({
   useCloudSyncStatus: () => mockSyncStatus,
 }));
 vi.mock('@/helpers/settings', () => ({ saveViewSettings: vi.fn() }));
+vi.mock('@/components/vocabulary/VocabularyDialog', () => ({
+  setVocabularyDialogVisible: vi.fn(),
+}));
 vi.mock('@/services/constants', () => ({
   MAX_ZOOM_LEVEL: 200,
   MIN_ZOOM_LEVEL: 50,
@@ -93,7 +96,7 @@ vi.mock('@/utils/webtoon', () => ({ getScrollGapAttr: vi.fn() }));
 vi.mock('@/app/reader/hooks/useCapturedTurn', () => ({ applyPageTurnAttributes: vi.fn() }));
 vi.mock('@/utils/config', () => ({ getMaxInlineSize: () => 720 }));
 vi.mock('@/utils/ambientLight', () => ({ nextThemeMode: (mode: string) => mode }));
-vi.mock('@/utils/window', () => ({ tauriHandleToggleFullScreen: vi.fn() }));
+vi.mock('@/utils/window', () => ({ canToggleFullScreen: () => false, toggleFullScreen: vi.fn() }));
 vi.mock('@/utils/event', () => ({
   eventDispatcher: { dispatch: (...a: unknown[]) => mockDispatch(...a), on: vi.fn(), off: vi.fn() },
 }));

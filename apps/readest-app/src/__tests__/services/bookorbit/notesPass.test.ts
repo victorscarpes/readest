@@ -98,6 +98,7 @@ const makeDeps = (overrides: Partial<NotesPassDeps> = {}): NotesPassDeps => ({
   mergeNotes: vi.fn(),
   resolvePosition: async () => ({ cfi: 'epubcfi(/6/10!/4/2/1:0)', verified: true }),
   populateXPointers: vi.fn(async (notes: BookNote[]) => notes),
+  chapterForNote: () => null,
   syncNotes: true,
   syncBookStates: false,
   now: () => NOW,
@@ -226,6 +227,49 @@ describe('runBookOrbitNotesPass', () => {
     expect(followUp.keysComplete).toBe(false);
   });
 
+  it('returns how many notes went out', async () => {
+    const notes = [
+      makeNote({ id: 'n1', xpointer0: '/body/DocFragment[4]/body/p[1]/text().0' }),
+      makeNote({ id: 'n2', xpointer0: '/body/DocFragment[4]/body/p[2]/text().0' }),
+    ];
+
+    const counts = await runBookOrbitNotesPass(makeDeps({ getNotes: () => notes }));
+
+    expect(counts).toEqual({ pushed: 2, pulled: 0 });
+  });
+
+  it('counts nothing for a book BookOrbit does not know', async () => {
+    const deps = makeDeps();
+    (deps.client.matchCheck as ReturnType<typeof vi.fn>).mockResolvedValue({ matches: [] });
+
+    expect(await runBookOrbitNotesPass(deps)).toMatchObject({
+      pushed: 0,
+      pulled: 0,
+      unmatched: true,
+    });
+  });
+
+  it('counts the chunks the server took before a later chunk failed', async () => {
+    const notes = Array.from({ length: 51 }, (_, i) =>
+      makeNote({
+        id: `n${i}`,
+        cfi: `epubcfi(/6/8!/4/2/${i}:0)`,
+        createdAt: NOW + i,
+        updatedAt: NOW,
+      }),
+    );
+    const deps = makeDeps({ getNotes: () => notes });
+    (deps.client.exchangeAnnotations as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(emptyExchangeResponse())
+      .mockRejectedValueOnce(new Error('HTTP 503'));
+    const counts = { pushed: 0, pulled: 0 };
+
+    await expect(runBookOrbitNotesPass(deps, counts)).rejects.toThrow('HTTP 503');
+
+    expect(counts.pushed).toBeGreaterThan(0);
+    expect(counts.pushed).toBeLessThan(51);
+  });
+
   it('applies pushed-down adds, acks them, and persists identities', async () => {
     const deps = makeDeps();
     const response = emptyExchangeResponse();
@@ -248,7 +292,7 @@ describe('runBookOrbitNotesPass', () => {
     ];
     (deps.client.exchangeAnnotations as ReturnType<typeof vi.fn>).mockResolvedValue(response);
 
-    await runBookOrbitNotesPass(deps);
+    expect((await runBookOrbitNotesPass(deps)).pulled).toBe(1);
 
     const merged = (deps.mergeNotes as ReturnType<typeof vi.fn>).mock.calls.find(
       (call) => (call[0] as BookNote[]).length > 0,
@@ -273,6 +317,27 @@ describe('runBookOrbitNotesPass', () => {
     );
     await expect(runBookOrbitNotesPass(deps)).rejects.toThrow('network down');
     expect(deps.store.setWatermark).not.toHaveBeenCalled();
+  });
+
+  it('sends each change with the chapter the resolver reports', async () => {
+    const deps = makeDeps({
+      getNotes: () => [makeNote({ id: 'hl' }), makeNote({ id: 'bm', type: 'bookmark' })],
+      chapterForNote: (note) => (note.type === 'bookmark' ? 'Chapter 5' : 'Chapter 4'),
+    });
+    (deps.client.getVersion as ReturnType<typeof vi.fn>).mockResolvedValue({
+      pluginVersion: '1',
+      serverVersion: '1',
+      capabilities: ['bookmarkSync'],
+    });
+
+    await runBookOrbitNotesPass(deps);
+
+    const annotations = (deps.client.exchangeAnnotations as ReturnType<typeof vi.fn>).mock
+      .calls[0]![0][0];
+    const bookmarks = (deps.client.exchangeBookmarks as ReturnType<typeof vi.fn>).mock
+      .calls[0]![0][0];
+    expect(annotations.changes[0].chapter).toBe('Chapter 4');
+    expect(bookmarks.changes[0].chapter).toBe('Chapter 5');
   });
 
   it('exchanges bookmarks only when the server advertises bookmarkSync', async () => {
@@ -399,5 +464,24 @@ describe('isBookOrbitPassEnabled', () => {
   it('does not run while disconnected or disabled', () => {
     expect(isBookOrbitPassEnabled({ ...base, syncProgress: true, enabled: false })).toBe(false);
     expect(isBookOrbitPassEnabled({ ...base, syncProgress: true, userkey: '' })).toBe(false);
+  });
+
+  it('keeps what moved before a pass failed, in counts the caller holds', async () => {
+    const deps = makeDeps({
+      getNotes: () => [makeNote({ updatedAt: NOW })],
+    });
+    (deps.client.exchangeBookmarks as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('HTTP 503'),
+    );
+    (deps.client.getVersion as ReturnType<typeof vi.fn>).mockResolvedValue({
+      pluginVersion: '1',
+      serverVersion: '1',
+      capabilities: ['bookmarkSync'],
+    });
+    const counts = { pushed: 0, pulled: 0 };
+
+    await expect(runBookOrbitNotesPass(deps, counts)).rejects.toThrow('HTTP 503');
+
+    expect(counts.pushed).toBeGreaterThan(0);
   });
 });
