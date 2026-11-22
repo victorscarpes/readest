@@ -19,17 +19,28 @@ Discord secrets and would only fail noisily here).
 
 ## How a release happens
 
-`.github/workflows/fork-sync-release.yml` runs daily (and on demand):
+`.github/workflows/fork-sync-release.yml` runs daily (and on demand). The fork's
+release tags are `<upstream tag>-<revision>` (e.g. `v0.12.20-0`, `v0.12.20-1`,
+`v0.12.21-0`): the base always matches the upstream version exactly; the
+revision counts fork-only rebuilds of that same upstream version and resets to
+`0` whenever upstream cuts a new one. (Releases from before this scheme exist
+as a plain `v0.12.20`-style tag with no revision — treated as revision `-1`,
+so the next rebuild of that version becomes `-0`.)
 
-1. Compare upstream's latest release tag to the fork's. Nothing new → stop.
+1. Compare upstream's latest release tag to the fork's current *base* version
+   (the tag with any `-N` stripped).
+   - New upstream version → build revision `0` of it.
+   - Same upstream version, triggered by a plain manual run (no inputs) →
+     build the next revision.
+   - Same upstream version, scheduled (cron) run → nothing to do, stop.
 2. `git checkout -B sync/<tag> <upstream tag>`, re-lay this `fork/` overlay.
 3. `git apply fork/patches/*.patch` → **conflict ⇒ issue + stop.**
 4. `pnpm install`; `setup-vendors`; `node fork/apply-overrides.mjs` → **anchor
    moved ⇒ issue + stop.**
 5. `pnpm lint` + arithmetic-JPEG vitest → **fail ⇒ issue + stop.**
 6. `tauri-action` builds the NSIS installer, signs it with the fork key, and
-   generates `latest.json`; all uploaded to a fork GitHub Release tagged the same
-   as upstream.
+   generates `latest.json`; all uploaded to a new fork GitHub Release tagged
+   `<upstream tag>-<revision>`.
 7. Fork `main` is force-pushed to the built state (linear history:
    `<upstream tag>` → `fork: overlay` → `fork: feature` → `fork: overrides`).
 
@@ -57,16 +68,29 @@ To change the fork and publish it against the **same** upstream base:
    `fork/patches/0001-acj-feature.patch` = `git diff <tag>..HEAD -- <new-file paths>`).
 2. Rebuild `main` = `<upstream tag> ─ fork-base ─ (empty) ─ patch ─ overrides`,
    `git tag -f fork-base`, `git push -f origin fork-base main`.
-3. `gh workflow run "Fork sync + release" -R victorscarpes/readest -f upstream_ref=v0.12.8 -f release_tag=v0.12.8`
+3. `gh workflow run "Fork sync + release" -R victorscarpes/readest` — **no inputs.**
+   The `check` job sees upstream hasn't moved and a manual (non-cron) run
+   happened, so it auto-numbers the next revision of the current upstream
+   version (e.g. current release is `v0.12.20-1` → this run publishes
+   `v0.12.20-2`). Pass `-f upstream_ref=... -f release_tag=...` only to
+   override that (e.g. to rebuild an older tag, or to publish a one-off tag
+   like `v0.12.8-test1` to deliberately exercise the in-app updater).
 
-It **reuses the tag** `v0.12.8`: the release is deleted and recreated, its assets
-replaced in place, the app version stays equal to the upstream base. One release
-per upstream tag, always the newest fork build.
+Every fork-only revision is its **own** release — nothing is deleted or
+overwritten in place anymore, so old `-N` builds stay in the releases list
+(cheap enough that pruning isn't automated; delete old ones by hand with `gh
+release delete` if the list gets long).
 
-**Caveat:** a same-version fork rev does **not** trip the in-app auto-updater
-(Tauri only updates on a strictly-higher semver) — download the fresh
-`*-setup.exe` and reinstall. Auto-update stays automatic for real upstream
-releases, which bump the version.
+**Caveat:** going from revision `N` to `N+1` of the *same* upstream version is
+a semver **pre-release** step (`0.12.20-1` sorts below plain `0.12.20`, and
+below `0.12.20-2`, per semver's pre-release precedence rules). That means:
+- `-N` → `-(N+1)` of the same base, and `-N` → a new upstream version's `-0`,
+  both compare as a real increase — the in-app updater picks those up
+  normally.
+- The **one-time** transition from a legacy plain `v0.12.20` tag to its first
+  numbered revision `v0.12.20-0` does **not** trip the updater (a pre-release
+  sorts below the plain version it's based on) — download the fresh
+  `*-setup.exe` once by hand for that specific jump.
 
 ## The signing key
 

@@ -13,7 +13,7 @@ on:
         description: 'Upstream tag/ref to build (default: their latest release)'
         required: false
       release_tag:
-        description: "Fork release tag (default: same as upstream). Use e.g. v0.12.8-test1 to test auto-update."
+        description: "Fork release tag (default: auto-numbered, e.g. v0.12.20-1). Use e.g. v0.12.8-test1 to test auto-update."
         required: false
   schedule:
     - cron: '0 6 * * *'
@@ -51,14 +51,40 @@ jobs:
           FORK_TAG=$(gh release view --repo "$FORK_REPO" --json tagName -q .tagName 2>/dev/null || echo "")
           echo "fork latest release:     ${FORK_TAG:-<none>}"
 
-          UPSTREAM_REF="${IN_REF:-$UP_TAG}"
-          RELEASE_TAG="${IN_TAG:-$UPSTREAM_REF}"
+          # Our own tags are "<upstream tag>-<fork revision>" (e.g. v0.12.20-1):
+          # the base tracks upstream's version exactly, the revision counts
+          # fork-only rebuilds of that same upstream version (reset to 0 each
+          # time upstream cuts a new one). A legacy un-suffixed tag (from
+          # before this scheme) is treated as revision -1, so the next fork
+          # revision of it starts at 0.
+          if [[ "$FORK_TAG" =~ ^(v[0-9][0-9.]*)-([0-9]+)$ ]]; then
+            FORK_BASE="${BASH_REMATCH[1]}"
+            FORK_REV="${BASH_REMATCH[2]}"
+          else
+            FORK_BASE="$FORK_TAG"
+            FORK_REV=-1
+          fi
 
           if [ -n "$IN_REF" ] || [ -n "$IN_TAG" ]; then
-            BUILD=true                       # manual dispatch always builds
-          elif [ "$UP_TAG" != "$FORK_TAG" ]; then
+            # Explicit manual override: full control, same as always.
+            UPSTREAM_REF="${IN_REF:-$UP_TAG}"
+            RELEASE_TAG="${IN_TAG:-$UPSTREAM_REF}"
+            BUILD=true
+          elif [ "$UP_TAG" != "$FORK_BASE" ]; then
+            # Upstream cut a new release we haven't built yet: revision 0.
+            UPSTREAM_REF="$UP_TAG"
+            RELEASE_TAG="${UP_TAG}-0"
+            BUILD=true
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            # Plain manual re-run with no inputs, upstream unchanged: cut the
+            # next fork-only revision of the same upstream version.
+            UPSTREAM_REF="$UP_TAG"
+            RELEASE_TAG="${UP_TAG}-$((FORK_REV + 1))"
             BUILD=true
           else
+            # Scheduled run, nothing changed upstream: no-op.
+            UPSTREAM_REF="$UP_TAG"
+            RELEASE_TAG="$FORK_TAG"
             BUILD=false
           fi
           echo "-> build=$BUILD  upstream_ref=$UPSTREAM_REF  release_tag=$RELEASE_TAG"
