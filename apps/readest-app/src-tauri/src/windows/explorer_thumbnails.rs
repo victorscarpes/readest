@@ -4,7 +4,7 @@ use winreg::{
     RegKey,
 };
 
-const PROVIDER: &str = "{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}";
+const PROVIDER: &str = "{D2C86420-833F-4E4E-B727-6DDC1079BC00}";
 const THUMBNAIL_HANDLER: &str = "{e357fccd-a995-4576-b01f-234630154e96}";
 const EXTENSIONS: [&str; 9] = [
     "epub", "mobi", "azw", "azw3", "kf8", "fb2", "cbz", "cbr", "pdf",
