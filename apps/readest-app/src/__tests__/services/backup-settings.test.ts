@@ -63,6 +63,17 @@ function makeSettings(overrides: Partial<SystemSettings> = {}): SystemSettings {
         updatedAt: 1,
       },
     ],
+    customTTSServices: [
+      {
+        id: 'tts-1',
+        name: 'My TTS',
+        baseUrl: 'https://tts.example.com/v1',
+        apiKey: 'tts-secret',
+        model: 'tts-1',
+        addedAt: 1,
+        updatedAt: 1,
+      },
+    ],
     kosync: {
       enabled: true,
       serverUrl: 'https://kosync.example',
@@ -149,6 +160,15 @@ describe('sanitizeSettingsForBackup - blacklist', () => {
     expect(out['customRootDir']).toBeUndefined();
     expect(out['externalLibraryFolders']).toBeUndefined();
     expect(out['savedBookCoverForLockScreenPath']).toBeUndefined();
+  });
+
+  it('strips the per-device Obsidian vault settings', () => {
+    const out = rec(
+      sanitizeSettingsForBackup(
+        makeSettings({ obsidian: { enabled: true, folder: '/Users/me/Vault/Readest' } }),
+      ),
+    );
+    expect(out['obsidian']).toBeUndefined();
   });
 
   it('strips per-device identity fields', () => {
@@ -249,6 +269,24 @@ describe('sanitizeSettingsForBackup - credentials', () => {
     expect(out.opdsCatalogs[0]!.password).toBeUndefined();
     expect(out.customTranslators![0]!.apiKey).toBeUndefined();
     expect(out.customTranslators![0]!.baseUrl).toBe('https://api.example.com/v1');
+    expect(out.customTTSServices![0]!.apiKey).toBeUndefined();
+    expect(out.customTTSServices![0]!.baseUrl).toBe('https://tts.example.com/v1');
+  });
+
+  it('strips Grimmory custom headers, which can hold access secrets', () => {
+    const settings = makeSettings();
+    const out = sanitizeSettingsForBackup({
+      ...settings,
+      grimmory: {
+        ...settings.grimmory,
+        serverUrl: 'https://grimmory.example',
+        password: 'gpass',
+        customHeaders: { 'CF-Access-Client-Secret': 'secret' },
+      },
+    });
+    expect(rec(out.grimmory)['password']).toBeUndefined();
+    expect(rec(out.grimmory)['customHeaders']).toBeUndefined();
+    expect(out.grimmory.serverUrl).toBe('https://grimmory.example');
   });
 
   it('keeps non-credential OPDS catalog fields when stripping credentials', () => {
@@ -268,6 +306,7 @@ describe('sanitizeSettingsForBackup - credentials', () => {
     expect(out.opdsCatalogs[0]!.username).toBe('opds-user');
     expect(out.opdsCatalogs[0]!.password).toBe('opds-pass');
     expect(out.customTranslators![0]!.apiKey).toBe('tr-secret');
+    expect(out.customTTSServices![0]!.apiKey).toBe('tts-secret');
   });
 
   it('still strips blacklist fields even when credentials are included', () => {
