@@ -1,0 +1,12 @@
+{
+  "name": "acj-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Build source for the lossless arithmetic-JPEG transcoder. Output is committed at apps/readest-app/src/services/acj/vendor/acj.js.",
+  "type": "module",
+  "scripts": {
+    "build": "docker run --rm -v \"$PWD/../..\":/repo -w /repo/packages/acj-wasm emscripten/emsdk:4.0.9 ./build.sh",
+    "verify": "node test/verify.mjs"
+  },
+  "license": "MIT"
+}
