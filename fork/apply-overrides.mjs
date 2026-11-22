@@ -6,7 +6,7 @@
  *
  *     node fork/apply-overrides.mjs
  *
- * It rewrites a handful of spots across six files, each edit guarded by an
+ * It rewrites a handful of spots across seven files, each edit guarded by an
  * anchor. If an anchor is missing (upstream refactored that spot) the script
  * exits non-zero with a clear message — `fork-sync-release.yml` turns that into a
  * "Fork sync failed" issue and publishes nothing. Every edit is value-based, so
@@ -20,8 +20,12 @@
  *      lines wiring the arithmetic-JPEG transcoder onto book.transformTarget.
  *   4. apps/readest-app/.env.tauri — DBUS_ID (Linux only; kept consistent).
  *   5. extensions/windows-thumbnail/src/com_provider.rs +
- *      src-tauri/nsis/installer-hooks.nsh — a fork-specific Explorer thumbnail
- *      CLSID (so it installs beside official Readest) + a guarded uninstall.
+ *      src-tauri/nsis/installer-hooks.nsh +
+ *      src-tauri/src/windows/explorer_thumbnails.rs (added upstream#7220,
+ *      v0.12.20 — its own hardcoded copy of the same CLSID, checked by the
+ *      "Use Readest for File Explorer thumbnails" settings toggle) — a
+ *      fork-specific Explorer thumbnail CLSID (so it installs beside official
+ *      Readest) + a guarded uninstall.
  *
  * Afterwards it runs `biome format --write` on the edited code/json so the tree
  * stays `pnpm format:check` clean.
@@ -189,6 +193,16 @@ edit('src-tauri/nsis/installer-hooks.nsh', (s) =>
   setStr(s, /!define CLSID_READEST_THUMBNAIL "(\{[^"}]+\})"/, forkClsidBrace),
 );
 
+// Since upstream#7220 (v0.12.20) the "Use Readest for File Explorer thumbnails"
+// settings toggle has its OWN hardcoded copy of the thumbnail CLSID, independent
+// of com_provider.rs / installer-hooks.nsh. Left unpatched, the toggle's runtime
+// check (looking for an installed DLL under *upstream's* CLSID) fails against a
+// fork install, which only ever registers the DLL under the fork's own CLSID —
+// surfaced to the user as "Could not update File Explorer thumbnails".
+edit('src-tauri/src/windows/explorer_thumbnails.rs', (s) =>
+  setStr(s, /const PROVIDER: &str = "(\{[^"}]+\})"/, forkClsidBrace),
+);
+
 // --- keep the tree biome-format clean ---------------------------------
 if (toFormat.size && !failed) {
   const biome = join(repoRoot, 'node_modules', '.bin', 'biome');
@@ -218,6 +232,7 @@ const expect = [
   ['.env.tauri', [`DBUS_ID=${cfg.dbusId}`]],
   ['extensions/windows-thumbnail/src/com_provider.rs', [forkClsidRust]],
   ['src-tauri/nsis/installer-hooks.nsh', [forkClsidBrace]],
+  ['src-tauri/src/windows/explorer_thumbnails.rs', [forkClsidBrace]],
 ];
 for (const [rel, needles] of expect) {
   const body = readFileSync(join(app, rel), 'utf8');
@@ -234,6 +249,7 @@ const gone = [
   ['src/services/constants.ts', /download\.readest\.com|readest\/readest\/releases/, 'upstream release URL'],
   ['extensions/windows-thumbnail/src/com_provider.rs', /0xA1B2C3D4_E5F6_7890_ABCD_EF1234567890/, "upstream thumbnail CLSID"],
   ['src-tauri/nsis/installer-hooks.nsh', /\{A1B2C3D4-E5F6-7890-ABCD-EF1234567890\}/i, 'upstream thumbnail CLSID'],
+  ['src-tauri/src/windows/explorer_thumbnails.rs', /\{A1B2C3D4-E5F6-7890-ABCD-EF1234567890\}/i, 'upstream thumbnail CLSID'],
 ];
 for (const [rel, re, what] of gone) {
   if (re.test(readFileSync(join(app, rel), 'utf8'))) {
