@@ -1,3 +1,5 @@
+// @vitest-environment happy-dom
+import { bookDataStoreHooks } from '@/__tests__/helpers/book-data-store-mock';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { act, cleanup, renderHook } from '@testing-library/react';
 import type { HardwarePageTurnerSettings } from '@/types/settings';
@@ -35,7 +37,7 @@ vi.mock('@/store/readerStore', () => ({
   ),
 }));
 vi.mock('@/store/bookDataStore', () => ({
-  useBookDataStore: () => ({ getBookData: () => ({}) }),
+  ...bookDataStoreHooks(() => ({ getBookData: () => ({}) })),
 }));
 vi.mock('@/store/settingsStore', () => ({
   useSettingsStore: Object.assign(
@@ -114,6 +116,37 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+});
+
+describe('usePagination pen gesture bindings (#7875)', () => {
+  test.each([
+    'PenSqueeze',
+    'PenSlideUp',
+    'PenSlideDown',
+  ])('%s forwards through the native handler exactly once without media interception', async (id) => {
+    h.settingsState.settings.hardwarePageTurner = {
+      enabled: true,
+      bindings: {
+        pagePrev: null,
+        pageNext: { source: 'native', id, label: id },
+        sectionPrev: null,
+        sectionNext: null,
+        refresh: null,
+      },
+    };
+    const view = makeView();
+    setupWithView(view);
+
+    expect(window.onNativeKeyDown).toBeDefined();
+    expect(interceptKeys).not.toHaveBeenCalledWith(
+      expect.objectContaining({ pageTurnerKeys: true }),
+    );
+    await act(async () => {
+      window.onNativeKeyDown?.(id);
+    });
+    expect(view.next).toHaveBeenCalledTimes(1);
+    expect(view.prev).not.toHaveBeenCalled();
+  });
 });
 
 describe('usePagination Apple Pencil bindings (#5501)', () => {

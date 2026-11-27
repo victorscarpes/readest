@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Shared mock control: tests can override createBehavior to change how create() behaves
@@ -306,7 +307,7 @@ describe('EdgeTTSClient', () => {
       await client.init();
       const voices = await client.getAllVoices();
       for (const voice of voices) {
-        expect(voice.disabled).toBe(false);
+        expect(voice.disabled).toBeFalsy();
       }
     });
 

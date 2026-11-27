@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // When a subscription is cancelled, the user may still hold other active
@@ -59,6 +60,13 @@ vi.mock('@/utils/supabase', () => ({
         return {
           select: () => ({
             eq: () => ({ in: () => Promise.resolve({ data: [], error: null }) }),
+          }),
+        };
+      }
+      if (table === 'gift_cards') {
+        return {
+          select: () => ({
+            eq: () => ({ eq: () => Promise.resolve({ data: [], error: null }) }),
           }),
         };
       }

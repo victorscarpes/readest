@@ -6,8 +6,8 @@ import * as CFI from 'foliate-js/epubcfi.js';
 import { PiMagnifyingGlass, PiNotePencil } from 'react-icons/pi';
 import { RiBookmark3Line, RiBookmarkLine } from 'react-icons/ri';
 
-import { useBookDataStore } from '@/store/bookDataStore';
-import { useReaderStore } from '@/store/readerStore';
+import { useBookConfig } from '@/store/bookDataStore';
+import { useBookProgress } from '@/store/readerProgressStore';
 import { useSidebarStore } from '@/store/sidebarStore';
 import { findTocItemBS } from '@/services/nav';
 import { findNearestCfi } from '@/utils/cfi';
@@ -23,6 +23,7 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { eventDispatcher } from '@/utils/event';
 import {
   filterBooknotes,
+  isAnnotationEntry,
   collectAnnotationFacets,
   summarizeAnnotationHub,
   AnnotationFilterKind,
@@ -48,12 +49,10 @@ const BooknoteView: React.FC<{
   toc: TOCItem[];
 }> = ({ type, bookKey, toc }) => {
   const _ = useTranslation();
-  const { getConfig } = useBookDataStore();
-  const { getProgress } = useReaderStore();
   const { setActiveBooknoteType, setBooknoteResults, isSearchBarVisible, setSearchBarVisible } =
     useSidebarStore();
-  const config = getConfig(bookKey)!;
-  const progress = getProgress(bookKey);
+  const config = useBookConfig(bookKey)!;
+  const progress = useBookProgress(bookKey);
   const allNotes = config.booknotes ?? [];
 
   const [filterKind, setFilterKind] = useState<AnnotationFilterKind>('all');
@@ -104,7 +103,7 @@ const BooknoteView: React.FC<{
   }, []);
 
   const liveAnnotations = useMemo(
-    () => allNotes.filter((note) => note.type === 'annotation' && !note.deletedAt),
+    () => allNotes.filter((note) => isAnnotationEntry(note) && !note.deletedAt),
     [allNotes],
   );
   const facets = useMemo(() => collectAnnotationFacets(liveAnnotations), [liveAnnotations]);

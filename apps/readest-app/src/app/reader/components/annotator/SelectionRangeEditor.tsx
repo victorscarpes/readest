@@ -73,7 +73,7 @@ const SelectionRangeEditor: React.FC<SelectionRangeEditorProps> = ({
   const { appService } = useEnv();
   const { settings } = useSettingsStore();
   const { isDarkMode } = useThemeStore();
-  const { getViewSettings } = useReaderStore();
+  const { getView, getViewSettings } = useReaderStore();
   const viewSettings = getViewSettings(bookKey);
   const isEink = settings.globalViewSettings.isEink;
   const einkFgColor = isDarkMode ? '#ffffff' : '#000000';
@@ -90,7 +90,7 @@ const SelectionRangeEditor: React.FC<SelectionRangeEditorProps> = ({
   const [currentEnd, setCurrentEnd] = useState<Point>({ x: 0, y: 0 });
   const [loupePoint, setLoupePoint] = useState<Point | null>(null);
 
-  useEffect(() => {
+  const placeHandles = useCallback(() => {
     if (draggingRef.current) return;
     // A cross-page selection's ends live on different pages: the start handle
     // on the first part, the end handle on the last.
@@ -107,6 +107,32 @@ const SelectionRangeEditor: React.FC<SelectionRangeEditorProps> = ({
     }
   }, [bookKey, selection, isVertical]);
 
+  useEffect(() => {
+    placeHandles();
+  }, [placeHandles]);
+
+  // The text can move under the same selection: the reader scrolls, or Pin to
+  // Notebook narrows the book cell and the page reflows (#7897). Place the
+  // handles again a frame later, as the toolbar is, so they stay on the text.
+  useEffect(() => {
+    let frame = 0;
+    const onMove = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(placeHandles);
+    };
+    const renderer = getView(bookKey)?.renderer;
+    renderer?.addEventListener('scroll', onMove);
+    const cell = document.querySelector(`#gridcell-${bookKey}`);
+    const observer =
+      cell && typeof ResizeObserver !== 'undefined' ? new ResizeObserver(onMove) : null;
+    if (cell) observer?.observe(cell);
+    return () => {
+      renderer?.removeEventListener('scroll', onMove);
+      observer?.disconnect();
+      cancelAnimationFrame(frame);
+    };
+  }, [bookKey, getView, placeHandles]);
+
   // The non-dragged end is anchored as a DOM position captured at drag start.
   // Anchoring it to its window coordinate instead would silently re-target it
   // whenever the content shifts underneath — e.g. the corner-dwell auto page
@@ -114,17 +140,20 @@ const SelectionRangeEditor: React.FC<SelectionRangeEditorProps> = ({
   const fixedAnchorRef = useRef<SectionAnchor | null>(null);
 
   const updateFromDraggedPoint = useCallback(
-    (point: Point, commit = false) => {
+    (point: Point, commit = false, handle?: 'start' | 'end') => {
       const anchor = fixedAnchorRef.current;
       if (!anchor) return;
-      void onDragTo(anchor, point, commit).then((bounds) => {
+      const activeHandle = handle ?? draggingRef.current;
+      const yBias = isVertical ? 0 : activeHandle === 'start' ? 2 : -2;
+      const adjustedPoint = isVertical ? point : { x: point.x, y: point.y + yBias };
+      void onDragTo(anchor, adjustedPoint, commit).then((bounds) => {
         if (bounds) boundsRef.current = bounds;
       });
       // Drag the handle into the corner to turn the page; the anchored end keeps
       // the previous page's part of the selection across the turn.
-      if (!commit) noteAutoTurnPoint(viewSettings?.scrolled ? null : point);
+      if (!commit) noteAutoTurnPoint(viewSettings?.scrolled ? null : adjustedPoint);
     },
-    [onDragTo, noteAutoTurnPoint, viewSettings?.scrolled],
+    [onDragTo, noteAutoTurnPoint, viewSettings?.scrolled, isVertical],
   );
 
   // Rebuild the range from the held handle position after an auto page-turn, so
@@ -176,14 +205,15 @@ const SelectionRangeEditor: React.FC<SelectionRangeEditorProps> = ({
   );
 
   const handleDragEnd = useCallback(() => {
-    const point = draggingRef.current === 'start' ? startRef.current : endRef.current;
+    const activeHandle = draggingRef.current;
+    const point = activeHandle === 'start' ? startRef.current : endRef.current;
+    updateFromDraggedPoint(point, true, activeHandle ?? undefined);
     draggingRef.current = null;
     setDraggingHandle(null);
     setLoupePoint(null);
     cancelAutoTurn();
     autoTurnUnsubRef.current?.();
     autoTurnUnsubRef.current = null;
-    updateFromDraggedPoint(point, true);
   }, [updateFromDraggedPoint, cancelAutoTurn]);
 
   if (currentStart.x === 0 && currentStart.y === 0) {

@@ -1,4 +1,5 @@
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+// @vitest-environment happy-dom
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // --- Dependency mocks (must be set up before importing the hook) ---
@@ -19,7 +20,12 @@ vi.mock('@/store/themeStore', () => ({
 }));
 
 const mockView = {
-  book: { primaryLanguage: 'en', sections: [{ id: 0 }] },
+  isConnected: true,
+  book: {
+    primaryLanguage: 'en',
+    sections: [{ id: 0 }],
+    rendition: undefined as { layout: string } | undefined,
+  },
   renderer: {
     getContents: () => [{ index: 0, doc: document as unknown as Document }],
     scrollToAnchor: vi.fn(),
@@ -28,7 +34,8 @@ const mockView = {
     nextSection: vi.fn(),
     start: 0,
     end: 0,
-    sideProp: 'height',
+    containerPosition: 0,
+    sideProp: 'height' as 'height' | 'width',
     next: vi.fn(),
     goTo: vi.fn(),
   },
@@ -64,6 +71,9 @@ const mockViewSettings = {
   ttsMediaMetadata: 'sentence',
   translationEnabled: false,
   ttsReadAloudText: 'source',
+  showHeader: false,
+  marginTopPx: 0,
+  scrollingOverlap: 0,
 };
 
 const mockBookData = {
@@ -157,6 +167,7 @@ vi.mock('@/services/tts', () => ({
       updateHighlightOptions: vi.fn(),
       setHighlightGranularity: vi.fn(),
       setSkipInlineAnnotations: vi.fn(),
+      setCustomTTSServices: vi.fn(),
       setLang: vi.fn(),
       setRate: vi.fn(),
       setSentenceGap: vi.fn(),
@@ -171,6 +182,7 @@ vi.mock('@/services/tts', () => ({
       startFromRange: vi.fn().mockReturnValue('<speak>hello</speak>'),
       stop: vi.fn().mockResolvedValue(undefined),
       shutdown: vi.fn().mockResolvedValue(undefined),
+      unblockSilentAudio: vi.fn(),
       forward: vi.fn().mockResolvedValue(undefined),
       backward: vi.fn().mockResolvedValue(undefined),
       getVoices: vi.fn().mockResolvedValue([]),
@@ -256,6 +268,9 @@ vi.mock('@/services/tts/TTSSessionManager', () => ({
   TTS_STOP_AT_CHAPTER_END: -1,
 }));
 
+const mockDownloadManager = vi.hoisted(() => ({ restartBook: vi.fn() }));
+vi.mock('@/services/tts/ttsDownloadManager', () => ({ ttsDownloadManager: mockDownloadManager }));
+
 vi.mock('@/utils/ssml', () => ({
   genSSMLRaw: vi.fn((s: string) => `<speak>${s}</speak>`),
   parseSSMLLang: vi.fn(() => 'en'),
@@ -298,10 +313,14 @@ vi.mock('@/utils/ttsTime', () => ({
 
 // Imports must come AFTER vi.mock calls so they pick up the mocked modules.
 import { useTTSControl } from '@/app/reader/hooks/useTTSControl';
+import { TTSController } from '@/services/tts';
 import { ttsMediaBridge } from '@/services/tts/ttsMediaBridge';
 import { eventDispatcher } from '@/utils/event';
 import { pageBreakFraction } from '@/utils/ttsPageFollow';
 import { useReaderStore } from '@/store/readerStore';
+import { useNotebookDocumentStore } from '@/store/notebookDocumentStore';
+import NotebookEditor from '@/app/reader/components/notebook/NotebookEditor';
+import AnnotationNoteEditor from '@/app/reader/components/annotator/AnnotationNoteEditor';
 
 const getSetTTSEnabledMock = () =>
   (
@@ -312,6 +331,12 @@ const getSetTTSEnabledMock = () =>
 
 const Harness = () => {
   useTTSControl({ bookKey: 'book-1' });
+  return null;
+};
+
+let hookApi: ReturnType<typeof useTTSControl> | null = null;
+const ApiHarness = () => {
+  hookApi = useTTSControl({ bookKey: 'book-1' });
   return null;
 };
 
@@ -411,6 +436,158 @@ describe('useTTSControl concurrent tts-speak events', () => {
       while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
       await Promise.all([p1, p2]);
     });
+  });
+});
+
+describe('useTTSControl changing the voice', () => {
+  beforeEach(() => {
+    ttsControllerInstances.length = 0;
+    pendingInitResolvers.length = 0;
+    mockDownloadManager.restartBook.mockClear();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('restarts the book download with the new voice (audio is cached per voice)', async () => {
+    render(<ApiHarness />);
+    await act(async () => {
+      const started = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await started;
+    });
+    await act(async () => {
+      await hookApi!.handleSetVoice('edge:en-US-AvaNeural', 'en');
+    });
+    expect(mockDownloadManager.restartBook).toHaveBeenCalledWith('book');
+  });
+
+  it('reads on with the new voice when asked to, though reading is stopped', async () => {
+    render(<ApiHarness />);
+    await act(async () => {
+      const started = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await started;
+    });
+    const controller = ttsControllerInstances.at(-1) as {
+      state: string;
+      start: ReturnType<typeof vi.fn>;
+      setVoice: ReturnType<typeof vi.fn>;
+    };
+    // A voice preview stopped reading.
+    controller.state = 'stop-paused';
+    controller.start.mockClear();
+    await act(async () => {
+      await hookApi!.handleSetVoice('edge:en-US-GuyNeural', 'en', true);
+    });
+    expect(controller.setVoice).toHaveBeenCalledWith('edge:en-US-GuyNeural', 'en');
+    await waitFor(() => expect(controller.start).toHaveBeenCalled());
+  });
+
+  it('plays the silent audio inside the tap, before stopping to switch voices', async () => {
+    render(<ApiHarness />);
+    await act(async () => {
+      const started = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await started;
+    });
+    const controller = ttsControllerInstances.at(-1) as {
+      state: string;
+      stop: ReturnType<typeof vi.fn>;
+      unblockSilentAudio: ReturnType<typeof vi.fn>;
+    };
+    controller.state = 'playing';
+    const calls: string[] = [];
+    controller.unblockSilentAudio.mockImplementation(() => calls.push('unblock'));
+    controller.stop.mockImplementation(async () => {
+      calls.push('stop');
+    });
+    // What runs before the first await is what runs inside the tap.
+    let beforeAwait: string[] = [];
+    await act(async () => {
+      const switching = hookApi!.handleSetVoice('edge:en-US-AvaNeural', 'en');
+      beforeAwait = [...calls];
+      await switching;
+    });
+    expect(beforeAwait, 'the silent audio plays before the switch leaves the tap').toEqual([
+      'unblock',
+      'stop',
+    ]);
+  });
+});
+
+describe('useTTSControl a start that fails', () => {
+  beforeEach(() => {
+    ttsControllerInstances.length = 0;
+    pendingInitResolvers.length = 0;
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('closes the player sheet it may have opened early', async () => {
+    const onRequestHidePanel = vi.fn();
+    const FailingHarness = () => {
+      useTTSControl({ bookKey: 'book-1', onRequestHidePanel });
+      return null;
+    };
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    render(<FailingHarness />);
+    await act(async () => {
+      const started = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      (
+        ttsControllerInstances[0] as { initViewTTS: ReturnType<typeof vi.fn> }
+      ).initViewTTS.mockRejectedValueOnce(new Error('no text on this page'));
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await started;
+    });
+    expect(onRequestHidePanel).toHaveBeenCalled();
+  });
+});
+
+describe('useTTSControl stopping while a start is still initializing', () => {
+  beforeEach(() => {
+    ttsControllerInstances.length = 0;
+    pendingInitResolvers.length = 0;
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('turning read aloud off cancels the start, and turning it on again works', async () => {
+    render(<Harness />);
+    await act(async () => {
+      const first = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      expect(ttsControllerInstances).toHaveLength(1);
+
+      // The engines are slow to initialize; the user turns read aloud off.
+      await eventDispatcher.dispatch('tts-stop', { bookKey: 'book-1' });
+      // ...and on again, without a reload.
+      const second = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      expect(ttsControllerInstances).toHaveLength(2);
+
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await Promise.all([first, second]);
+    });
+    const [stale, live] = ttsControllerInstances as Array<{
+      initViewTTS: ReturnType<typeof vi.fn>;
+      speak: ReturnType<typeof vi.fn>;
+      shutdown: ReturnType<typeof vi.fn>;
+    }>;
+    // The cancelled start never touches the view or speaks over the new session.
+    expect(stale!.initViewTTS).not.toHaveBeenCalled();
+    expect(stale!.speak).not.toHaveBeenCalled();
+    expect(stale!.shutdown).toHaveBeenCalled();
+    expect(live!.speak).toHaveBeenCalled();
   });
 });
 
@@ -742,11 +919,23 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
     mockProgress.range = null;
     mockViewSettings.ttsLocation = null;
     vi.mocked(pageBreakFraction).mockReturnValue(null);
+    // jsdom lays nothing out: give every range the box rendered text has.
+    Range.prototype.getClientRects = () => [VISIBLE_RECT] as unknown as DOMRectList;
   });
 
   afterEach(() => {
     cleanup();
+    delete (Range.prototype as Partial<Range>).getClientRects;
   });
+
+  const VISIBLE_RECT = { x: 40, y: 120, width: 300, height: 24 } as DOMRect;
+  // Text the book hides but still reads aloud (#7153): a display:none long
+  // description has no box, screen-reader text sits off the left edge.
+  const unrenderedRange = (rects: Partial<DOMRect>[]) => {
+    const range = new Range();
+    range.getClientRects = () => rects as unknown as DOMRectList;
+    return range;
+  };
 
   const setupAndCaptureHighlightHandler = async (
     eventName: 'tts-highlight-mark' | 'tts-highlight-word' = 'tts-highlight-mark',
@@ -917,6 +1106,56 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
     }).not.toThrow();
   });
 
+  it('holds the page for a sentence the book hides (#7153)', async () => {
+    const handler = await setupAndCaptureHighlightHandler();
+    for (const rects of [[], [{ x: -10000, y: 300, width: 1, height: 1 }]]) {
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => unrenderedRange(rects) });
+      await act(async () => {
+        handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/8)' } }));
+      });
+    }
+    // foliate settles an anchor with no box on the section start.
+    expect(mockView.renderer.scrollToAnchor).not.toHaveBeenCalled();
+    expect(mockViewSettings.ttsLocation).toBe('epubcfi(/6/4!/4/8)');
+
+    // The next shown sentence is followed again.
+    const shown = new Range();
+    mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => shown });
+    await act(async () => {
+      handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/10)' } }));
+    });
+    expect(mockView.renderer.scrollToAnchor).toHaveBeenCalledWith(shown);
+  });
+
+  it('holds the scrolled view for a sentence the book hides (#7153)', async () => {
+    const handler = await setupAndCaptureHighlightHandler();
+    mockView.renderer.scrolled = true;
+    const range = unrenderedRange([]);
+    range.getBoundingClientRect = () => ({ x: 0, y: 0, width: 0, height: 0 }) as DOMRect;
+    mockView.renderer.start = 800;
+    mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => range });
+    try {
+      await act(async () => {
+        handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/8)' } }));
+      });
+      expect(mockView.renderer.scrollToAnchor).not.toHaveBeenCalled();
+    } finally {
+      mockView.renderer.start = 0;
+    }
+  });
+
+  it('holds the page for a spoken word the book hides (#7153)', async () => {
+    const handler = await setupAndCaptureHighlightHandler('tts-highlight-word');
+    const wordRange = unrenderedRange([]);
+    wordRange.compareBoundaryPoints = vi.fn().mockReturnValue(1);
+    mockProgress.range = {} as Range;
+    mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => wordRange });
+
+    handler(new CustomEvent('tts-highlight-word', { detail: { cfi: 'epubcfi(/6/4!/4/8)' } }));
+
+    expect(mockView.renderer.scrollToAnchor).not.toHaveBeenCalled();
+  });
+
   it('bails without scrolling when the cfi resolves to a null range (READEST-21)', async () => {
     const handler = await setupAndCaptureHighlightHandler();
     // In-section (index 0 == primaryIndex 0) so the follow-scroll path runs,
@@ -954,6 +1193,7 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
     const handler = await setupAndCaptureHighlightHandler('tts-highlight-word');
     const wordRange = {
       compareBoundaryPoints: vi.fn().mockReturnValueOnce(1).mockReturnValueOnce(0),
+      getClientRects: () => [VISIBLE_RECT],
     } as unknown as Range;
     const visibleRange = {} as Range;
     mockView.renderer.primaryIndex = 1;
@@ -971,6 +1211,7 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
     const handler = await setupAndCaptureHighlightHandler('tts-highlight-word');
     const wordRange = {
       compareBoundaryPoints: vi.fn().mockReturnValueOnce(1).mockReturnValueOnce(0),
+      getClientRects: () => [VISIBLE_RECT],
     } as unknown as Range;
     mockProgress.range = {} as Range;
     mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => wordRange });
@@ -978,6 +1219,352 @@ describe('useTTSControl handleHighlightMark cross-section navigation', () => {
     handler(new CustomEvent('tts-highlight-word', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
 
     expect(mockView.renderer.scrollToAnchor).toHaveBeenCalledWith(wordRange);
+  });
+
+  // In scrolled mode the view follows the voice by scrolling the text being
+  // read to three lines below the top, so the lines just read stay on screen
+  // above it, instead of to the very top (#7895).
+  describe('in scrolled mode (#7895)', () => {
+    let before: HTMLParagraphElement;
+    let para: HTMLParagraphElement;
+
+    beforeEach(() => {
+      mockView.renderer.scrolled = true;
+      // The visible part of the section: 500px to 976px.
+      mockView.renderer.start = 500;
+      mockView.renderer.end = 976;
+      mockView.renderer.containerPosition = 1000;
+      before = document.createElement('p');
+      before.textContent = 'So she was considering, in her own mind.';
+      para = document.createElement('p');
+      para.style.lineHeight = '20px';
+      para.textContent = 'Alice was beginning to get very tired of sitting by her sister.';
+      document.body.append(before, para);
+    });
+
+    afterEach(() => {
+      before.remove();
+      para.remove();
+      mockView.book.rendition = undefined;
+      mockViewSettings.showHeader = false;
+      mockViewSettings.marginTopPx = 0;
+      mockView.renderer.sideProp = 'height';
+      mockView.renderer.start = 0;
+      mockView.renderer.end = 0;
+      mockView.renderer.containerPosition = 0;
+    });
+
+    const textAt = (top: number, height: number) => {
+      const range = document.createRange();
+      range.setStart(para.firstChild!, 0);
+      range.setEnd(para.firstChild!, 5);
+      range.getBoundingClientRect = () => ({ x: 40, y: top, width: 300, height }) as DOMRect;
+      return range;
+    };
+
+    it('scrolls a sentence that runs past the bottom to three lines below the top', async () => {
+      const handler = await setupAndCaptureHighlightHandler();
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => textAt(950, 40) });
+
+      await act(async () => {
+        handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+      });
+
+      // The sentence's top (950) lands 3 lines (3 x 20px) below the top (500).
+      expect(mockView.renderer.containerPosition).toBe(1000 + 950 - 500 - 60);
+      expect(mockView.renderer.scrollToAnchor).not.toHaveBeenCalled();
+    });
+
+    it('scrolls a spoken word that reaches the bottom to three lines below the top', async () => {
+      const handler = await setupAndCaptureHighlightHandler('tts-highlight-word');
+      mockProgress.range = null;
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => textAt(966, 20) });
+
+      handler(new CustomEvent('tts-highlight-word', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+
+      expect(mockView.renderer.containerPosition).toBe(1000 + 966 - 500 - 60);
+      expect(mockView.renderer.scrollToAnchor).not.toHaveBeenCalled();
+    });
+
+    it('holds still while the spoken word is on screen, whatever the last relocate saw', async () => {
+      const handler = await setupAndCaptureHighlightHandler('tts-highlight-word');
+      // A relocate lags a scroll, so the visible range can still end before
+      // a word the view already shows.
+      const stale = document.createRange();
+      stale.selectNodeContents(before);
+      mockProgress.range = stale;
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => textAt(600, 20) });
+
+      handler(new CustomEvent('tts-highlight-word', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+
+      expect(mockView.renderer.containerPosition).toBe(1000);
+      expect(mockView.renderer.scrollToAnchor).not.toHaveBeenCalled();
+    });
+
+    it('leaves vertical text to foliate, which scrolls it sideways', async () => {
+      const handler = await setupAndCaptureHighlightHandler();
+      mockView.renderer.sideProp = 'width';
+      const range = textAt(0, 0);
+      range.getBoundingClientRect = () => ({ x: 950, y: 40, width: 40, height: 300 }) as DOMRect;
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => range });
+
+      await act(async () => {
+        handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+      });
+
+      expect(mockView.renderer.scrollToAnchor).toHaveBeenCalledWith(range);
+      expect(mockView.renderer.containerPosition).toBe(1000);
+    });
+
+    // The out-of-view check counts a header-sized band at the top as hidden.
+    // Text landing inside it would be followed again on every line.
+    it('lands below the header band when that is taller than three lines', async () => {
+      const handler = await setupAndCaptureHighlightHandler();
+      mockViewSettings.showHeader = true;
+      mockViewSettings.marginTopPx = 144;
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => textAt(950, 40) });
+
+      await act(async () => {
+        handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+      });
+
+      expect(mockView.renderer.containerPosition).toBe(1000 + 950 - 500 - 144);
+    });
+
+    it('keeps the word on screen in a view shorter than six lines', async () => {
+      const handler = await setupAndCaptureHighlightHandler('tts-highlight-word');
+      mockView.renderer.end = 700;
+      para.style.lineHeight = '80px';
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => textAt(700, 80) });
+
+      handler(new CustomEvent('tts-highlight-word', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+
+      // Three 80px lines don't fit in 200px: the word lands halfway down.
+      expect(mockView.renderer.containerPosition).toBe(1000 + 700 - 500 - 100);
+    });
+
+    it('keeps a short view clear of the header band when the word fits below it', async () => {
+      const handler = await setupAndCaptureHighlightHandler('tts-highlight-word');
+      mockView.renderer.end = 700;
+      mockViewSettings.showHeader = true;
+      mockViewSettings.marginTopPx = 120;
+      para.style.lineHeight = '80px';
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => textAt(700, 20) });
+
+      handler(new CustomEvent('tts-highlight-word', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+
+      expect(mockView.renderer.containerPosition).toBe(1000 + 700 - 500 - 120);
+    });
+
+    // A fixed-layout page measures its text from the page, while the renderer
+    // counts from the book's start.
+    it('leaves fixed-layout pages to foliate', async () => {
+      mockView.book.rendition = { layout: 'pre-paginated' };
+      const markHandler = await setupAndCaptureHighlightHandler();
+      const sentence = textAt(950, 40);
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => sentence });
+      await act(async () => {
+        markHandler(
+          new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }),
+        );
+      });
+      expect(mockView.renderer.scrollToAnchor).toHaveBeenCalledWith(sentence);
+
+      const controller = ttsControllerInstances[0] as {
+        addEventListener: { mock: { calls: [string, (e: Event) => void][] } };
+      };
+      const wordHandler = controller.addEventListener.mock.calls.find(
+        ([name]) => name === 'tts-highlight-word',
+      )![1];
+      const stale = document.createRange();
+      stale.selectNodeContents(before);
+      mockProgress.range = stale;
+      const word = textAt(966, 20);
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => word });
+      wordHandler(new CustomEvent('tts-highlight-word', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+
+      expect(mockView.renderer.scrollToAnchor).toHaveBeenCalledWith(word);
+      expect(mockView.renderer.containerPosition).toBe(1000);
+    });
+  });
+
+  // Following the voice focuses the spoken text inside the book's iframe and
+  // turns the page, which takes the caret (and an IME composition) out of a
+  // note being typed and closes its popup (#6837). While a host text area has
+  // focus the view holds still; the saved location still advances.
+  describe('while a note is being typed (#6837)', () => {
+    let editor: HTMLTextAreaElement;
+
+    beforeEach(() => {
+      editor = document.createElement('textarea');
+      editor.setAttribute('data-note-editor', '');
+      document.body.appendChild(editor);
+      editor.focus();
+    });
+
+    afterEach(() => {
+      editor.remove();
+    });
+
+    it('does not scroll to the next sentence but still saves its location', async () => {
+      const handler = await setupAndCaptureHighlightHandler();
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => new Range() });
+
+      await act(async () => {
+        handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+      });
+
+      expect(mockView.renderer.scrollToAnchor).not.toHaveBeenCalled();
+      expect(mockViewSettings.ttsLocation).toBe('epubcfi(/6/4!/4/2)');
+      expect(document.activeElement).toBe(editor);
+    });
+
+    it('does not navigate to a sentence in the next section', async () => {
+      const handler = await setupAndCaptureHighlightHandler();
+      mockView.resolveCFI.mockReturnValue({ index: 1, anchor: () => new Range() });
+
+      await act(async () => {
+        handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/8!/4/2)' } }));
+      });
+
+      expect(mockView.goTo).not.toHaveBeenCalled();
+    });
+
+    it('does not follow a word off the page', async () => {
+      const handler = await setupAndCaptureHighlightHandler('tts-highlight-word');
+      const wordRange = {
+        compareBoundaryPoints: vi.fn().mockReturnValueOnce(1).mockReturnValueOnce(0),
+      } as unknown as Range;
+      mockProgress.range = {} as Range;
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => wordRange });
+
+      handler(new CustomEvent('tts-highlight-word', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+
+      expect(mockView.renderer.scrollToAnchor).not.toHaveBeenCalled();
+    });
+
+    it('does not turn the page for a sentence that started before typing', async () => {
+      editor.blur();
+      vi.useFakeTimers();
+      try {
+        const handler = await setupAndCaptureHighlightHandler();
+        const controller = ttsControllerInstances[0] as unknown as {
+          getSentenceProgress: ReturnType<typeof vi.fn>;
+          state: string;
+        };
+        controller.state = 'playing';
+        vi.mocked(pageBreakFraction).mockReturnValue(0.75);
+        mockView.renderer.end = 528;
+        mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => new Range() });
+        controller.getSentenceProgress.mockReturnValue(0);
+
+        await act(async () => {
+          handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+        });
+
+        editor.focus();
+        controller.getSentenceProgress.mockReturnValue(0.8);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(400);
+        });
+        expect(mockView.renderer.next).not.toHaveBeenCalled();
+      } finally {
+        mockView.renderer.end = 0;
+        mockView.renderer.next = vi.fn();
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not move the view to the next section the voice starts', async () => {
+      await setupAndCaptureHighlightHandler();
+      const onSectionChange = vi.mocked(TTSController).mock.calls.at(-1)![4] as (
+        index: number,
+      ) => Promise<void>;
+      mockView.renderer.goTo.mockClear();
+
+      await act(async () => {
+        await onSectionChange(0);
+      });
+      expect(mockView.renderer.goTo).not.toHaveBeenCalled();
+
+      editor.blur();
+      await act(async () => {
+        await onSectionChange(0);
+      });
+      expect(mockView.renderer.goTo).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps following while a text field that is not a note editor has focus', async () => {
+      const handler = await setupAndCaptureHighlightHandler();
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => new Range() });
+      const templateField = document.createElement('textarea');
+      document.body.appendChild(templateField);
+      templateField.focus();
+
+      try {
+        await act(async () => {
+          handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+        });
+
+        expect(mockView.renderer.scrollToAnchor).toHaveBeenCalledTimes(1);
+      } finally {
+        templateField.remove();
+      }
+    });
+
+    it('follows again once the note editor loses focus', async () => {
+      const handler = await setupAndCaptureHighlightHandler();
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => new Range() });
+      editor.blur();
+
+      await act(async () => {
+        handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+      });
+
+      expect(mockView.renderer.scrollToAnchor).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // The hold is for editors a page turn takes away: the note popup closes on
+  // relocation. The Notebook stays open beside the page, and the book no
+  // longer takes the caret from a text field, so the page keeps up with the
+  // voice while it is typed in (#7663).
+  describe('which note editors hold the view (#7663)', () => {
+    const followMark = async () => {
+      const handler = await setupAndCaptureHighlightHandler();
+      mockView.resolveCFI.mockReturnValue({ index: 0, anchor: () => new Range() });
+      await act(async () => {
+        handler(new CustomEvent('tts-highlight-mark', { detail: { cfi: 'epubcfi(/6/4!/4/2)' } }));
+      });
+    };
+
+    it('turns the page with the voice while the Notebook is typed in', async () => {
+      useNotebookDocumentStore.getState().hydrate('book', '', null);
+      render(
+        <NotebookEditor
+          bookKey='book-1'
+          handleOpenAnnotations={vi.fn()}
+          excerpts={[]}
+          onDeleteExcerpt={vi.fn()}
+        />,
+      );
+      const notebook = screen.getByRole('textbox', { name: 'Notebook' });
+      notebook.focus();
+      expect(document.activeElement).toBe(notebook);
+
+      await followMark();
+
+      expect(mockView.renderer.scrollToAnchor).toHaveBeenCalledTimes(1);
+    });
+
+    it('holds the view while the note popup is typed in', async () => {
+      render(<AnnotationNoteEditor value='' onSave={vi.fn()} onCancel={vi.fn()} />);
+      expect(document.activeElement?.localName).toBe('textarea');
+
+      await followMark();
+
+      expect(mockView.renderer.scrollToAnchor).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -1108,42 +1695,45 @@ describe('useTTSControl background session lifecycle', () => {
     expect(mockSessionManager.stopActive).toHaveBeenCalledWith('replaced');
   });
 
+  const makeLiveController = () => ({
+    kind: 'tts',
+    state: 'playing',
+    terminated: false,
+    isViewAttached: false,
+    shutdown: vi.fn(),
+    detachView: vi.fn(),
+    attachView: vi.fn().mockResolvedValue(undefined),
+    getSpeakingLang: vi.fn().mockReturnValue('en'),
+    getCurrentHighlightCfi: vi.fn().mockReturnValue(null),
+    getCurrentPlaybackCfi: vi.fn().mockReturnValue(null),
+    getSectionIndex: vi.fn().mockReturnValue(0),
+    isSoundingSentenceOnScreen: vi.fn().mockReturnValue(false),
+    getSpokenSentence: vi.fn().mockReturnValue(null),
+    updateHighlightOptions: vi.fn(),
+    setHighlightGranularity: vi.fn(),
+    setSkipInlineAnnotations: vi.fn(),
+    setCustomTTSServices: vi.fn(),
+    drawLoopRange: vi.fn(),
+    getVoiceId: vi.fn().mockReturnValue(''),
+    setTargetLang: vi.fn(),
+    setLang: vi.fn(),
+    setRate: vi.fn(),
+    pause: vi.fn().mockResolvedValue(true),
+    resume: vi.fn().mockResolvedValue(true),
+    start: vi.fn().mockResolvedValue(undefined),
+    stop: vi.fn().mockResolvedValue(undefined),
+    forward: vi.fn().mockResolvedValue(undefined),
+    backward: vi.fn().mockResolvedValue(undefined),
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    redispatchPosition: vi.fn(),
+    usesAudioTransport: vi.fn().mockReturnValue(false),
+    supportsLyrics: vi.fn().mockReturnValue(true),
+    isBuffering: vi.fn().mockReturnValue(false),
+  });
+
   it('adopts a live session for the same book without constructing a controller', async () => {
-    const liveController = {
-      kind: 'tts',
-      state: 'playing',
-      terminated: false,
-      isViewAttached: false,
-      shutdown: vi.fn(),
-      detachView: vi.fn(),
-      attachView: vi.fn().mockResolvedValue(undefined),
-      getSpeakingLang: vi.fn().mockReturnValue('en'),
-      getCurrentHighlightCfi: vi.fn().mockReturnValue(null),
-      getCurrentPlaybackCfi: vi.fn().mockReturnValue(null),
-      getSectionIndex: vi.fn().mockReturnValue(0),
-      isSoundingSentenceOnScreen: vi.fn().mockReturnValue(false),
-      getSpokenSentence: vi.fn().mockReturnValue(null),
-      updateHighlightOptions: vi.fn(),
-      setHighlightGranularity: vi.fn(),
-      setSkipInlineAnnotations: vi.fn(),
-      drawLoopRange: vi.fn(),
-      getVoiceId: vi.fn().mockReturnValue(''),
-      setTargetLang: vi.fn(),
-      setLang: vi.fn(),
-      setRate: vi.fn(),
-      pause: vi.fn().mockResolvedValue(true),
-      resume: vi.fn().mockResolvedValue(true),
-      start: vi.fn().mockResolvedValue(undefined),
-      stop: vi.fn().mockResolvedValue(undefined),
-      forward: vi.fn().mockResolvedValue(undefined),
-      backward: vi.fn().mockResolvedValue(undefined),
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-      redispatchPosition: vi.fn(),
-      usesAudioTransport: vi.fn().mockReturnValue(false),
-      supportsLyrics: vi.fn().mockReturnValue(true),
-      isBuffering: vi.fn().mockReturnValue(false),
-    };
+    const liveController = makeLiveController();
     mockSessionManager.getSessionByHash.mockReturnValue({
       bookHash: 'book',
       bookKey: 'book-old',
@@ -1163,6 +1753,92 @@ describe('useTTSControl background session lifecycle', () => {
       expect.objectContaining({ bookKey: 'book-1' }),
     );
     expect(liveController.setSkipInlineAnnotations).toHaveBeenCalledWith(false);
+  });
+
+  // #7787: the engine resolves its voice on the first utterance, after the
+  // clients report ready, and nothing announces it.
+  it('picks up the voice the engine resolves once reading starts', async () => {
+    vi.useFakeTimers();
+    try {
+      const liveController = makeLiveController();
+      mockSessionManager.getSessionByHash.mockReturnValue({
+        bookHash: 'book',
+        bookKey: 'book-old',
+        controller: liveController,
+      });
+      render(<ApiHarness />);
+      await act(async () => {
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+      });
+      expect(hookApi!.voiceId).toBe('');
+      liveController.getVoiceId.mockReturnValue('en-US-AvaNeural');
+      await act(async () => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(hookApi!.voiceId).toBe('en-US-AvaNeural');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A sheet opened as a new session starts must not take the last session's
+  // voice before the next poll (#7787).
+  it('clears the voice when a new session starts', async () => {
+    const liveController = makeLiveController();
+    liveController.getVoiceId.mockReturnValue('en-US-AvaNeural');
+    mockSessionManager.getSessionByHash.mockReturnValue({
+      bookHash: 'book',
+      bookKey: 'book-old',
+      controller: liveController,
+    });
+    render(<ApiHarness />);
+    await act(async () => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    expect(hookApi!.voiceId).toBe('en-US-AvaNeural');
+    let speaking: Promise<unknown> | undefined;
+    await act(async () => {
+      speaking = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    // The new clients are still initializing.
+    expect(pendingInitResolvers.length).toBeGreaterThan(0);
+    expect(hookApi!.voiceId).toBe('');
+    await act(async () => {
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await speaking;
+    });
+  });
+
+  // Back from another route the reader remounts under the same book key; the
+  // store still holds the previous, detached view until the new one opens.
+  // Attaching to that one would draw every highlight off screen.
+  it('waits for the view on screen instead of adopting into a detached one', async () => {
+    const liveController = makeLiveController();
+    mockSessionManager.getSessionByHash.mockReturnValue({
+      bookHash: 'book',
+      bookKey: 'book-1',
+      controller: liveController,
+    });
+    mockView.isConnected = false;
+    try {
+      render(<Harness />);
+      await act(async () => {
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+      });
+      expect(liveController.attachView).not.toHaveBeenCalled();
+
+      mockView.isConnected = true;
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      });
+      expect(liveController.attachView).toHaveBeenCalledWith(
+        mockView,
+        expect.objectContaining({ bookKey: 'book-1' }),
+      );
+    } finally {
+      mockView.isConnected = true;
+    }
   });
 });
 
@@ -1259,5 +1935,47 @@ describe('useTTSControl gap control (handleSetSentenceGap / handleSupportsGapCon
     expect(mockViewSettings.ttsRate).toBe(1.5);
     expect(controller.setSentenceGap).toHaveBeenCalledWith(0.12);
     expect(controller.setParagraphGap).toHaveBeenCalledWith(0.24);
+  });
+});
+
+describe('useTTSControl quota toast', () => {
+  beforeEach(() => {
+    ttsControllerInstances.length = 0;
+    pendingInitResolvers.length = 0;
+    mockSessionManager.claim.mockClear();
+    mockSessionManager.getSessionByHash.mockReturnValue(null);
+    mockSessionManager.getActiveSession.mockReturnValue(null);
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  const startSession = async () => {
+    render(<Harness />);
+    await act(async () => {
+      const p = eventDispatcher.dispatch('tts-speak', { bookKey: 'book-1' });
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      while (pendingInitResolvers.length > 0) pendingInitResolvers.shift()!();
+      await p;
+    });
+    await act(async () => {
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    });
+  };
+
+  it('shows a toast when the premium TTS quota is exceeded', async () => {
+    await startSession();
+    const controller = ttsControllerInstances[0] as {
+      addEventListener: ReturnType<typeof vi.fn>;
+    };
+    const call = controller.addEventListener.mock.calls.find(
+      (args: unknown[]) => args[0] === 'tts-quota-exceeded',
+    );
+    expect(call).toBeDefined();
+    const dispatchSpy = vi.spyOn(eventDispatcher, 'dispatch');
+    (call![1] as () => void)();
+    expect(dispatchSpy).toHaveBeenCalledWith('toast', expect.objectContaining({ type: 'error' }));
+    dispatchSpy.mockRestore();
   });
 });

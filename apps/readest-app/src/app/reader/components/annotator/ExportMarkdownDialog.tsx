@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useId } from 'react';
 import { marked } from 'marked';
 import { useEnv } from '@/context/EnvContext';
 import { useTranslation } from '@/hooks/useTranslation';
@@ -25,6 +25,8 @@ import {
 } from '@/app/reader/utils/annotatorUtil';
 import { renderNoteTemplate, formatBlockQuote } from '@/utils/note';
 import { getPublicCoverUrl } from '@/utils/cover';
+import { sanitizeNoteHtml } from '@/app/reader/utils/noteMarkdown';
+import { toDateKey } from '@/services/statistics/readingStats';
 import {
   AnnotationLinkType,
   buildAnnotationAppUrl,
@@ -75,7 +77,7 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
   const _ = useTranslation();
   const { envConfig, appService } = useEnv();
   const { settings } = useSettingsStore();
-  const { getBookData } = useBookDataStore();
+  const getBookData = useBookDataStore((s) => s.getBookData);
   const { getViewSettings } = useReaderStore();
   const viewSettings = getViewSettings(bookKey);
 
@@ -142,6 +144,7 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
 
   const [showSource, setShowSource] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const templateId = useId();
 
   // Resolving a cover URL may publish the local cover to public storage, so it
   // runs only when the export actually references one: the checkbox in simple
@@ -356,7 +359,7 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
 
       // Add export date
       if (exportConfig.includeDate) {
-        lines.push(`**${_('Exported from Readest')}**: ${new Date().toISOString().slice(0, 10)}`);
+        lines.push(`**${_('Exported from Readest')}**: ${toDateKey(new Date())}`);
         lines.push('');
       }
 
@@ -455,7 +458,7 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
   // Convert markdown to HTML for preview
   const htmlPreview = useMemo(() => {
     if (!markdownPreview || isJson) return '';
-    const html = marked.parse(markdownPreview) as string;
+    const html = sanitizeNoteHtml(marked.parse(markdownPreview) as string);
     return (
       html
         .replace(/<a href=/g, '<a target="_blank" rel="noopener noreferrer" href=')
@@ -474,11 +477,14 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
     }));
   };
 
-  // macOS is the only platform with both a system share sheet and a native
-  // Save panel, so it gets a Share button next to a Save button that writes
-  // to disk (#6201). Elsewhere a single Export keeps the platform's one path:
-  // share sheet on iOS/Android, save dialog on Windows/Linux, download on web.
-  const canSaveAndShare = !!appService?.isMacOSApp;
+  // macOS gets a Share button next to a Save button that writes to disk
+  // (#6201). Android's share sheet can't save the file to storage, so it gets
+  // an Export button that opens the system save dialog next to Share.
+  // Elsewhere a single Export keeps the platform's one path: share sheet on
+  // iOS, save dialog on Windows/Linux, download on web.
+  const isAndroid = !!appService?.isAndroidApp;
+  const isMacOS = !!appService?.isMacOSApp;
+  const canSaveAndShare = isMacOS || isAndroid;
 
   const handleExport = (e: React.MouseEvent<HTMLButtonElement>, share: boolean) => {
     // Anchor the macOS / iPad share sheet to the clicked button's rect so
@@ -767,7 +773,9 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
                   <>
                     <div className='space-y-2'>
                       <div className='flex items-center justify-between'>
-                        <label className='text-sm font-medium'>{_('Export Template')}</label>
+                        <label htmlFor={templateId} className='text-sm font-medium'>
+                          {_('Export Template')}
+                        </label>
                         <button
                           onClick={() =>
                             setExportConfig({ ...exportConfig, customTemplate: defaultTemplate })
@@ -778,6 +786,7 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
                         </button>
                       </div>
                       <textarea
+                        id={templateId}
                         value={exportConfig.customTemplate}
                         onChange={(e) =>
                           setExportConfig({ ...exportConfig, customTemplate: e.target.value })
@@ -1034,26 +1043,35 @@ const ExportMarkdownDialog: React.FC<ExportMarkdownDialogProps> = ({
         </div>
 
         {/* Footer Actions */}
-        <div className='mt-4 flex items-center justify-end'>
+        {/* The native insets on Android cover only the display cutout; env()
+            also counts the navigation bar, and 16px clears rounded corners. */}
+        <div
+          className='mt-4 flex items-center justify-end'
+          style={{
+            paddingBottom: appService?.hasSafeAreaInset
+              ? 'calc(env(safe-area-inset-bottom, 0px) + 16px)'
+              : undefined,
+          }}
+        >
           <div className='flex gap-4'>
             <button onClick={onCancel} className='btn btn-ghost btn-sm'>
               {_('Cancel')}
             </button>
             {canSaveAndShare && (
               <button
-                onClick={(e) => handleExport(e, true)}
-                className='btn btn-ghost btn-sm'
+                onClick={(e) => handleExport(e, isMacOS)}
+                className='btn btn-ghost btn-sm eink-bordered'
                 disabled={filteredNotesCount === 0 || isLoadingContext}
               >
-                {_('Share')}
+                {isMacOS ? _('Share') : _('Export')}
               </button>
             )}
             <button
-              onClick={(e) => handleExport(e, !canSaveAndShare)}
-              className='btn btn-primary btn-sm'
+              onClick={(e) => handleExport(e, !isMacOS)}
+              className='btn btn-contrast btn-sm'
               disabled={filteredNotesCount === 0 || isLoadingContext}
             >
-              {canSaveAndShare ? _('Save') : _('Export')}
+              {isMacOS ? _('Save') : isAndroid ? _('Share') : _('Export')}
             </button>
           </div>
         </div>

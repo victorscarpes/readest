@@ -1,3 +1,4 @@
+// @vitest-environment happy-dom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('@/utils/misc', async (importOriginal) => {
@@ -28,6 +29,9 @@ import {
   applyImageStyle,
   applyNamespacedAttributes,
   keepTextAlignment,
+  applyLinkHitArea,
+  LINK_HIT_AREA_CLASS,
+  MAX_ENLARGED_LINKS,
 } from '@/utils/style';
 import {
   DEFAULT_BOOK_FONT,
@@ -300,6 +304,21 @@ describe('getThemeCode', () => {
     expect(getThemeCode().isDarkMode).toBe(true);
   });
 
+  // On an e-ink device the reader starts on the Contrast theme until a theme
+  // is picked. The book has to get the same black text, not the Default
+  // theme's #171717, which an e-ink screen shows as gray.
+  it('gives the book the contrast theme on an e-ink device with no theme picked', () => {
+    window.__READEST_IS_EINK = true;
+    try {
+      expect(getThemeCode()).toMatchObject({ fg: '#000000', bg: '#ffffff' });
+
+      localStorage.setItem('themeColor', 'default');
+      expect(getThemeCode().fg).toBe('#171717');
+    } finally {
+      delete window.__READEST_IS_EINK;
+    }
+  });
+
   it('falls back to default theme when custom themeColor not found', () => {
     localStorage.setItem('themeColor', 'nonexistent-theme-xyz');
     localStorage.setItem('themeMode', 'light');
@@ -499,6 +518,60 @@ describe('getStyles', () => {
     const clampRule = css.match(/\n\s*img\.has-text-siblings\s*\{[^}]*\}/)![0];
     expect(clampRule).not.toContain('vertical-align');
   });
+
+  it('draws inline glyphs and gaiji as ink in the text color in dark mode (#7373, #7981)', () => {
+    const vs = makeViewSettings({ invertImgColorInDark: false });
+    const themeCode: ThemeCode = {
+      bg: '#171717',
+      fg: '#ffffff',
+      primary: '#0066cc',
+      palette: {
+        'base-100': '#171717',
+        'base-200': '#222222',
+        'base-300': '#333333',
+        'base-content': '#ffffff',
+        neutral: '#cccccc',
+        'neutral-content': '#444444',
+        primary: '#0066cc',
+        secondary: '#3399ff',
+        accent: '#0055aa',
+      },
+      isDarkMode: true,
+    };
+    const css = getStyles(vs, themeCode);
+    expect(css).toMatch(
+      /img\[class\*="gaiji"\]\s*\{[^}]*filter:\s*url\(#readest-dark-monochrome-ffffff\);/,
+    );
+    expect(css).toMatch(/img\[class\*="gaiji"\]\s*\{[^}]*mix-blend-mode:\s*normal;/);
+  });
+
+  it('keeps inline and gaiji parent backgrounds transparent over a background texture (#7373)', () => {
+    const vs = makeViewSettings({ overrideColor: true, backgroundTextureId: 'leaves' });
+    const themeCode: ThemeCode = {
+      bg: '#171717',
+      fg: '#ffffff',
+      primary: '#0066cc',
+      palette: {
+        'base-100': '#171717',
+        'base-200': '#222222',
+        'base-300': '#333333',
+        'base-content': '#ffffff',
+        neutral: '#cccccc',
+        'neutral-content': '#444444',
+        primary: '#0066cc',
+        secondary: '#3399ff',
+        accent: '#0055aa',
+      },
+      isDarkMode: true,
+    };
+    const css = getStyles(vs, themeCode);
+    expect(css).toMatch(
+      /\*:has\(>\s*img\.has-text-siblings\):not\(body\)\s*\{[^}]*background-color:\s*transparent;/,
+    );
+    expect(css).toMatch(
+      /\*:has\(>\s*img\[class\*="gaiji"\]\):not\(body\)\s*\{[^}]*background-color:\s*transparent;/,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -525,6 +598,24 @@ describe('applyImageStyle', () => {
     const img = document.querySelector('img')!;
     expect(img.hasAttribute('height')).toBe(false);
     expect(img.style.height).toBeTruthy();
+  });
+
+  it('preserves aspect ratio with object-fit: contain when both width and height percentages are specified', () => {
+    document.body.innerHTML = '<div><img width="100%" height="100%" /></div>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.hasAttribute('width')).toBe(false);
+    expect(img.hasAttribute('height')).toBe(false);
+    expect(img.style.objectFit).toBe('contain');
+  });
+
+  it('uses --available-height for %-based height calculation when defined', () => {
+    document.documentElement.style.setProperty('--available-height', '800');
+    document.body.innerHTML = '<div><img height="50%" /></div>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.style.height).toBe('400px');
+    document.documentElement.style.removeProperty('--available-height');
   });
 
   it('does not convert pixel-based width attributes', () => {
@@ -579,6 +670,79 @@ describe('applyImageStyle', () => {
     expect(img.classList.contains('has-text-siblings-baseline')).toBe(false);
   });
 
+  it('adds has-text-siblings to gaiji images even without text siblings (#7373)', () => {
+    document.body.innerHTML = '<p><img class="gaiji" src="test.png" /></p>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.classList.contains('has-text-siblings')).toBe(true);
+  });
+
+  it('adds has-text-siblings when image is inside an inline wrapper with block text siblings (#7373)', () => {
+    document.body.innerHTML =
+      '<p>Prefix text <span class="tcy"><img src="test.png" /></span> suffix text</p>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.classList.contains('has-text-siblings')).toBe(true);
+  });
+
+  it('does not add has-text-siblings when wrapped image has BR siblings in parent container (#7373)', () => {
+    document.body.innerHTML = '<p>Caption<br><span><img src="photo.jpg"></span></p>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.classList.contains('has-text-siblings')).toBe(false);
+  });
+
+  it('adds has-text-siblings when image is inside nested ruby elements with text siblings (#7373)', () => {
+    document.body.innerHTML =
+      '<p>Text <ruby><rb><img src="glyph.png"></rb><rt>reading</rt></ruby> text</p>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.classList.contains('has-text-siblings')).toBe(true);
+  });
+
+  it('adds has-text-siblings when wrapped image is followed by a BR later in the paragraph (#7373)', () => {
+    document.body.innerHTML = '<p>前<span><img src="glyph.png"></span>後<br>次</p>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.classList.contains('has-text-siblings')).toBe(true);
+  });
+
+  it('adds has-text-siblings when unwrapped image is followed by a BR later in the paragraph (#7373)', () => {
+    document.body.innerHTML = '<p>前<img src="glyph.png">後<br>次</p>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.classList.contains('has-text-siblings')).toBe(true);
+  });
+
+  it('does not add has-text-siblings through link ancestors (#7373)', () => {
+    document.body.innerHTML = '<p>Figure 1 <a href="#"><img src="photo.jpg"></a></p>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.classList.contains('has-text-siblings')).toBe(false);
+  });
+
+  it('still adds has-text-siblings to gaiji inside a link (#7373)', () => {
+    document.body.innerHTML = '<p><a href="#"><img class="gaiji" src="glyph.png"></a></p>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.classList.contains('has-text-siblings')).toBe(true);
+  });
+
+  it('adds has-text-siblings when adjacent inline element has text siblings (#7373)', () => {
+    document.body.innerHTML =
+      '<p><span class="koboSpan">Text</span><span><img src="glyph.png"></span></p>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.classList.contains('has-text-siblings')).toBe(true);
+  });
+
+  it('does not add has-text-siblings when adjacent inline element contains a BR (#7373)', () => {
+    document.body.innerHTML = '<p><span>Caption<br></span><span><img src="photo.jpg"></span></p>';
+    applyImageStyle(document);
+    const img = document.querySelector('img')!;
+    expect(img.classList.contains('has-text-siblings')).toBe(false);
+  });
+
   it('sets pointer-events: none on img[zy-enlarge-src="none"] and keeps the attribute', () => {
     document.body.innerHTML = '<img zy-enlarge-src="none" src="a.png" />';
 
@@ -600,6 +764,139 @@ describe('applyImageStyle', () => {
     document.querySelectorAll('img').forEach((img) => {
       expect(img.style.pointerEvents).toBe('');
     });
+  });
+
+  // :only-child ignores text nodes, so a selector like
+  // p:has(> a:only-child > img:only-child) also matched a body paragraph with
+  // a footnote icon (<a class="duokan-footnote"><img></a>) and dropped its
+  // indent.
+  it('exempts paragraphs that start with an image from the indent, not text paragraphs with an inline image', () => {
+    document.body.innerHTML = `
+      <p id="figure"><img src="a.png"/></p>
+      <p id="linked"><a href="#"><img src="a.png"/></a></p>
+      <p id="wrapped"><span><a href="#"><img src="a.png"/></a></span></p>
+      <p id="captioned"><a id="anchor"></a><img src="a.png"/><br/>Caption</p>
+      <p id="dropcap"><img src="d.png"/>ext</p>
+      <p id="footnote">Text<a class="duokan-footnote" href="#"><img src="n.png"/></a>more text</p>
+      <p id="footnote-end">Text<a class="duokan-footnote" href="#"><img src="n.png"/></a></p>
+      <p id="icon">Text<span><img src="i.png"/></span></p>
+      <p id="text-break">Text<br/><img src="a.png"/></p>
+      <p id="text-anchor">Text<a id="anchor2"></a><img src="a.png"/></p>
+    `;
+    applyImageStyle(document);
+
+    const css = getStyles(makeViewSettings({ textIndent: 2 }));
+    const block = css.split('}').find((b) => b.includes('(#6198)'))!;
+    const selector = block.slice(block.lastIndexOf('*/') + 2, block.indexOf('{'));
+    const exempt = Array.from(document.querySelectorAll(selector)).map((p) => p.id);
+
+    expect(exempt).toEqual(['figure', 'linked', 'wrapped', 'captioned', 'dropcap']);
+  });
+
+  // A section holding only one image is a picture page, fitted to one page (#6676)
+  const SVG = 'xmlns="http://www.w3.org/2000/svg"';
+  it.each([
+    ['an image in a paragraph', '<p><img src="c.png" /></p>', true],
+    [
+      'an image with an empty skip link',
+      '<p><img src="c.png" /><span aria-label="x"></span></p>',
+      true,
+    ],
+    ['an svg cover', `<div><svg ${SVG}><image href="c.png" /></svg></div>`, true],
+    [
+      'an svg cover with a title and desc',
+      `<div><svg ${SVG}><title>Cover</title><desc>Front</desc><image href="c.png" /></svg></div>`,
+      true,
+    ],
+    ['an image with a caption', '<p><img src="c.png" /></p><p>Plate 1</p>', false],
+    ['an svg with visible text', `<svg ${SVG}><text>Chapter 1</text></svg>`, false],
+    ['two images', '<p><img src="a.png" /></p><p><img src="b.png" /></p>', false],
+  ])('tells whether %s is a lone image', (_, html, lone) => {
+    document.body.innerHTML = html;
+    applyImageStyle(document);
+    expect(document.querySelectorAll('.lone-image')).toHaveLength(lone ? 1 : 0);
+  });
+
+  // An image with no text on its line is top-aligned in WebKit so a page-tall
+  // one fits its page (#6676); an image sharing its line with text keeps the
+  // book's alignment, even inside a link
+  it.each([
+    ['an image and a line break', '<p><img src="c.png" /><br /></p>', true],
+    ['an image in a div', '<div><img src="c.png" /></div>', true],
+    ['a linked image', '<p><a href="#p"><img src="c.png" /></a></p>', true],
+    ['an image above its caption', '<p><img src="c.png" /><br />Plate 1</p>', true],
+    ['an image beside a comment', '<p><!-- plate --><img src="c.png" /></p>', true],
+    [
+      'an image before a span that breaks the line',
+      '<p><img src="c.png" /><span><br />Caption</span></p>',
+      true,
+    ],
+    [
+      'an image after a break inside its span',
+      '<p>Caption<span><br /><img src="c.png" /></span></p>',
+      true,
+    ],
+    [
+      'an image in a span made a block, before text',
+      '<p><span style="display: block"><img src="c.png" /></span>Text</p>',
+      true,
+    ],
+    [
+      'an image between paragraphs',
+      '<div><p>Before</p><img src="c.png" /><p>After</p></div>',
+      true,
+    ],
+    [
+      'an image after text in a link',
+      '<p>Figure 1 <a href="#f"><img src="c.png" /></a></p>',
+      false,
+    ],
+    [
+      'a linked icon before text',
+      '<p><a href="#n"><img class="icon" src="n.png" /></a>Text</p>',
+      false,
+    ],
+    ['an image beside linked text', '<p><img src="c.png" /><a href="#n">Note</a></p>', false],
+    ['an image in a span after text', '<p>Text <span><img src="c.png" /></span></p>', false],
+    [
+      'an image before a span with text, then a break',
+      '<p><img src="c.png" /><span>Note<br />Caption</span></p>',
+      false,
+    ],
+    [
+      'an image before a hidden break and text',
+      '<p><img src="c.png" /><br style="display: none" />Text</p>',
+      false,
+    ],
+    [
+      'a linked icon in a div made inline, before text',
+      '<div><div style="display: inline"><a href="#n"><img src="n.png" /></a></div> Text</div>',
+      false,
+    ],
+  ])('tells whether %s is alone on its line', (_, html, alone) => {
+    document.body.innerHTML = html;
+    applyImageStyle(document);
+    expect(document.querySelectorAll('img.alone-on-line')).toHaveLength(alone ? 1 : 0);
+  });
+});
+
+describe('applyLinkHitArea', () => {
+  const links = (n: number) => '<a href="#x">1</a>'.repeat(n);
+
+  beforeEach(() => {
+    document.documentElement.classList.remove(LINK_HIT_AREA_CLASS);
+  });
+
+  it('opts a document with up to MAX_ENLARGED_LINKS links in', () => {
+    document.body.innerHTML = links(MAX_ENLARGED_LINKS);
+    applyLinkHitArea(document);
+    expect(document.documentElement.classList.contains(LINK_HIT_AREA_CLASS)).toBe(true);
+  });
+
+  it('leaves a document with more links than MAX_ENLARGED_LINKS out', () => {
+    document.body.innerHTML = links(MAX_ENLARGED_LINKS + 1);
+    applyLinkHitArea(document);
+    expect(document.documentElement.classList.contains(LINK_HIT_AREA_CLASS)).toBe(false);
   });
 });
 
@@ -659,6 +956,24 @@ describe('keepTextAlignment', () => {
     expect(document.querySelector('p')!.classList.contains('aligned-center')).toBe(true);
     expect(document.querySelector('div')!.classList.contains('aligned-right')).toBe(true);
     expect(document.querySelector('blockquote')!.classList.contains('aligned-justify')).toBe(true);
+  });
+
+  it('skips the hidden placeholders of a chunked section', () => {
+    // A chunk of a huge section keeps one empty placeholder per top-level
+    // element outside it (foliate-js section-chunks.js): tens of thousands
+    // of them in a single-file book, none of which is ever shown.
+    document.body.innerHTML = `
+      <p data-foliate-chunk="0"></p>
+      <p style="text-align: center;">centered</p>
+      <div data-foliate-chunk="2"></div>
+    `;
+    const spy = vi.spyOn(window, 'getComputedStyle');
+    keepTextAlignment(document);
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
+    expect(document.querySelector('p:not([data-foliate-chunk])')!.classList).toContain(
+      'aligned-center',
+    );
   });
 });
 

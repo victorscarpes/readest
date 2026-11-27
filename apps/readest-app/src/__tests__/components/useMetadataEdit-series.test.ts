@@ -1,3 +1,4 @@
+// @vitest-environment happy-dom
 import { act, renderHook } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
@@ -32,6 +33,16 @@ describe('useMetadataEdit numeric series fields', () => {
     });
 
     expect(result.current.editedMeta.seriesIndex).toBe(1.5);
+  });
+
+  it('keeps a zero index', () => {
+    const { result } = renderHook(() => useMetadataEdit(indexedMetadata, noTags));
+
+    act(() => {
+      result.current.handleFieldChange('seriesIndex', '0');
+    });
+
+    expect(result.current.editedMeta.seriesIndex).toBe(0);
   });
 
   it('clears the index when the input is emptied', () => {

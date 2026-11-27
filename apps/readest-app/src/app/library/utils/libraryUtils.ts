@@ -3,13 +3,22 @@ import {
   LibraryGroupByType,
   LibrarySecondarySortByType,
   LibrarySortByType,
+  LibrarySortCriterion,
 } from '@/types/settings';
 import {
   formatAuthors,
+  formatDescription,
+  formatLanguage,
+  formatPublisher,
   formatTitle,
+  getBookPageCount,
   getContributorNames,
   isCurrentlyReadingBook,
+  isLastNameFirst,
 } from '@/utils/book';
+import { matchesFieldedQuery, parseFieldedQuery } from './fieldedQuery';
+import { getBookshelfField, textList } from '@/services/bookshelves/fields';
+import { code6392to6391, normalizedLangCode } from '@/utils/lang';
 import { md5Fingerprint } from '@/utils/md5';
 import type { TranslationFunc } from '@/hooks/useTranslation';
 import { stubTranslation as _ } from '@/utils/misc';
@@ -243,6 +252,15 @@ export const selectAbsOfflineBooks = (
   );
 };
 
+/**
+ * Whether a bulk "Remove from Device Only" may drop this book's local file
+ * (#7318): only when the book stays somewhere else — the cloud, or the
+ * Audiobookshelf server for an offline ABS download — so the library keeps a
+ * copy to download again.
+ */
+export const canRemoveFromDeviceOnly = (book: Book): boolean =>
+  (!!book.downloadedAt && !!book.uploadedAt) || !!book.absDownloadedAt;
+
 // Calibre custom column names and values, flattened for searching (#4811).
 const getCalibreColumnsText = (item: Book) =>
   (item.metadata?.calibreColumns ?? [])
@@ -299,7 +317,101 @@ export const applyBookTagEdits = (
 const getBookValuesText = (book: Book): string =>
   [...getBookTags(book), ...getBookSubjects(book)].join(' ');
 
-export const createBookFilter = (queryTerm: string | null) => (item: Book) => {
+const present = (...values: (string | undefined | null)[]): string[] =>
+  values.filter((value): value is string => !!value);
+
+const getCalibreColumnValues = (book: Book, label: string): string[] =>
+  (book.metadata?.calibreColumns ?? [])
+    .filter((column) => column.label.toLowerCase() === label)
+    .flatMap(({ value }) => (Array.isArray(value) ? value : [String(value)]));
+
+const readShelfField = (book: Book, id: string): string[] =>
+  textList(getBookshelfField(id)?.read(book)).filter(Boolean);
+
+const getBookLanguages = (book: Book): string[] => {
+  const codes = readShelfField(book, 'language');
+  // "en-US" and "eng" are named by their base language, as "en" is.
+  const names = codes.map((code) => {
+    const base = normalizedLangCode(code);
+    return formatLanguage(code6392to6391(base) || base);
+  });
+  return [...codes, ...names];
+};
+
+const getBookIdentifiers = (book: Book): string[] => {
+  const metadata = book.metadata;
+  const alternates = [metadata?.altIdentifier ?? []]
+    .flat()
+    .map((id) => (typeof id === 'string' ? id : id.value));
+  return present(metadata?.identifier, metadata?.isbn, ...alternates);
+};
+
+/** The fields a bare word next to fielded terms reads, besides calibre columns. */
+const BARE_WORD_FIELDS = [
+  'title',
+  'author',
+  'tags',
+  'series',
+  'publisher',
+  'language',
+  'format',
+  'description',
+  'group',
+  'identifier',
+];
+
+/**
+ * The values a fielded search term reads (#7370). A field reads the bookshelf
+ * field of the same id (src/services/bookshelves/fields.ts), so search and
+ * bookshelf rules agree on what a book's series or group is. The cases below
+ * add what search needs on top. `null` is a bare word next to fields, and
+ * `#label` is a calibre column.
+ */
+const getBookFieldValues = (book: Book, field: string | null): string[] => {
+  const metadata = book.metadata;
+  switch (field) {
+    case null:
+      return [
+        ...BARE_WORD_FIELDS.flatMap((name) => getBookFieldValues(book, name)),
+        getCalibreColumnsText(book),
+      ];
+    case 'author':
+      // Each contributor too, so author:="j. r. r. tolkien" matches a co-author.
+      return [
+        ...new Set([...readShelfField(book, 'author'), ...getContributorNames(metadata?.author)]),
+      ].filter(Boolean);
+    case 'tags':
+      // Calibre writes its tags as EPUB subjects, so tag: reads both.
+      return [...readShelfField(book, 'tags'), ...readShelfField(book, 'subjects')];
+    case 'publisher':
+      // The bookshelf field drops a publisher stored as a language map.
+      return present(metadata?.publisher && formatPublisher(metadata.publisher));
+    case 'language':
+      return getBookLanguages(book);
+    case 'description':
+      return readShelfField(book, 'description').map((text) => formatDescription(text));
+    case 'identifier':
+      return getBookIdentifiers(book);
+    default:
+      return field.startsWith('#')
+        ? getCalibreColumnValues(book, field.slice(1))
+        : readShelfField(book, field);
+  }
+};
+
+/**
+ * Library search. A query naming a field (`author:herbert and tags:scifi`)
+ * runs as a calibre-like fielded search (#7370); any other query keeps the
+ * plain search below.
+ */
+export const createBookFilter = (queryTerm: string | null) => {
+  const fielded = queryTerm ? parseFieldedQuery(queryTerm) : null;
+  if (!fielded) return createPlainBookFilter(queryTerm);
+  return (item: Book): boolean =>
+    !item.deletedAt && matchesFieldedQuery(fielded, (field) => getBookFieldValues(item, field));
+};
+
+const createPlainBookFilter = (queryTerm: string | null) => (item: Book) => {
   if (!queryTerm) return true;
   if (item.deletedAt) return false;
   let searchTerm: RegExp;
@@ -428,16 +540,43 @@ const getShelfItemTimeRemaining = (item: Book | BooksGroup): number | undefined 
  * sort-order multiplier, otherwise descending would float those items to the top.
  */
 export const withTimeRemainingLast =
-  <T extends Book | BooksGroup>(sortBy: LibrarySortByType, compare: (a: T, b: T) => number) =>
+  <T extends Book | BooksGroup>(
+    sortBy: LibrarySortByType,
+    compare: (a: T, b: T) => number,
+    tieBreakWhenBothUnavailable = false,
+  ) =>
   (a: T, b: T): number => {
     if (sortBy !== LibrarySortByType.TimeRemaining) return compare(a, b);
     const aTime = getShelfItemTimeRemaining(a);
     const bTime = getShelfItemTimeRemaining(b);
-    if (aTime === undefined && bTime === undefined) return 0;
+    if (aTime === undefined && bTime === undefined) {
+      return tieBreakWhenBothUnavailable ? compare(a, b) : 0;
+    }
     if (aTime === undefined) return 1;
     if (bTime === undefined) return -1;
     return compare(a, b);
   };
+
+// localeCompare with an options object builds a new collator on every call, which
+// is ~20x slower in V8, so title sorts reuse one numeric collator per locale.
+const numericCollators = new Map<string, Intl.Collator>();
+const compareTitles = (a: string, b: string, uiLanguage: string): number => {
+  const locale = uiLanguage || navigator.language;
+  let collator = numericCollators.get(locale);
+  if (!collator) {
+    collator = new Intl.Collator(locale, { numeric: true });
+    numericCollators.set(locale, collator);
+  }
+  return collator.compare(a, b);
+};
+
+const stripLeadingArticle = (title: string): string =>
+  title.replace(/^\s*(?:a|an|the)\s+(?=\S)/i, '');
+
+const getTitleSortValue = (book: Book): string => stripLeadingArticle(formatTitle(book.title));
+
+// An undated book sorts as the oldest, against books and groups alike.
+const UNDATED_PUBLISHED = '0001-01-01';
 
 const compareBookByKey = (
   a: Book,
@@ -448,9 +587,9 @@ const compareBookByKey = (
 ): number => {
   switch (sortBy) {
     case LibrarySortByType.Title: {
-      const aTitle = formatTitle(a.title);
-      const bTitle = formatTitle(b.title);
-      return aTitle.localeCompare(bTitle, uiLanguage || navigator.language);
+      const aTitle = getTitleSortValue(a);
+      const bTitle = getTitleSortValue(b);
+      return compareTitles(aTitle, bTitle, uiLanguage);
     }
     case LibrarySortByType.Author: {
       const aAuthors = formatAuthors(a.author, a?.primaryLanguage || 'en', true);
@@ -465,6 +604,8 @@ const compareBookByKey = (
       return a.format.localeCompare(b.format, uiLanguage || navigator.language);
     case LibrarySortByType.Progress:
       return getBookReadRatio(a) - getBookReadRatio(b);
+    case LibrarySortByType.Pages:
+      return (getBookPageCount(a) ?? 0) - (getBookPageCount(b) ?? 0);
     case LibrarySortByType.Series: {
       // Group by series name first so books of the same series stay consecutive,
       // then order within a series by index. Comparing index alone would interleave
@@ -476,13 +617,8 @@ const compareBookByKey = (
       return (a.metadata?.seriesIndex || 0) - (b.metadata?.seriesIndex || 0);
     }
     case LibrarySortByType.Published: {
-      const aPublished = a.metadata?.published || '0001-01-01';
-      const bPublished = b.metadata?.published || '0001-01-01';
-
-      // Handle cases where published date might not exist
-      if (!aPublished && !bPublished) return 0;
-      if (!aPublished) return 1; // Books without published date go to the end
-      if (!bPublished) return -1;
+      const aPublished = a.metadata?.published || UNDATED_PUBLISHED;
+      const bPublished = b.metadata?.published || UNDATED_PUBLISHED;
 
       // Try to parse dates - handle various date formats
       const aDate = new Date(aPublished).getTime();
@@ -512,6 +648,25 @@ const compareBookByKey = (
   }
 };
 
+/** `compareBookByKey` in the given direction. A book with no time remaining stays
+ * after the timed ones either way, as `withTimeRemainingLast` keeps it at rank 1. */
+const compareBookByCriterion = (
+  a: Book,
+  b: Book,
+  by: string,
+  ascending: boolean,
+  uiLanguage: string,
+  pageDurations?: Readonly<Record<string, number>>,
+): number => {
+  const cmp = compareBookByKey(a, b, by, uiLanguage, pageDurations);
+  if (by === LibrarySortByType.TimeRemaining) {
+    const aMissing = getDisplayedTimeRemaining(a, pageDurations?.[a.hash]) === undefined;
+    const bMissing = getDisplayedTimeRemaining(b, pageDurations?.[b.hash]) === undefined;
+    if (aMissing !== bMissing) return cmp;
+  }
+  return cmp * (ascending ? 1 : -1);
+};
+
 /**
  * @param secondarySortBy - Optional tiebreaker key applied when the primary
  *   comparison returns 0. Pass `'none'` (or omit) to disable. A Series secondary
@@ -529,14 +684,33 @@ export const createBookSorter =
     sortAscending: boolean = true,
     secondaryAscending: boolean = true,
     pageDurations?: Readonly<Record<string, number>>,
+    sortOrder?: LibrarySortCriterion[],
   ) =>
   (a: Book, b: Book): number => {
-    const primary = compareBookByKey(a, b, sortBy, uiLanguage, pageDurations);
-    if (primary !== 0) return primary * (sortAscending ? 1 : -1);
+    if (sortOrder && sortOrder.length > 0) {
+      for (const criterion of sortOrder) {
+        const cmp = compareBookByCriterion(
+          a,
+          b,
+          criterion.by,
+          criterion.ascending,
+          uiLanguage,
+          pageDurations,
+        );
+        if (cmp !== 0) return cmp;
+      }
+      return 0;
+    }
+    const primary = compareBookByCriterion(a, b, sortBy, sortAscending, uiLanguage, pageDurations);
+    if (primary !== 0) return primary;
     if (secondarySortBy === 'none') return 0;
-    return (
-      compareBookByKey(a, b, secondarySortBy, uiLanguage, pageDurations) *
-      (secondaryAscending ? 1 : -1)
+    return compareBookByCriterion(
+      a,
+      b,
+      secondarySortBy,
+      secondaryAscending,
+      uiLanguage,
+      pageDurations,
     );
   };
 
@@ -590,21 +764,41 @@ export const getBreadcrumbs = (currentPath: string) => {
 
 /**
  * Parse a combined author string into individual author names.
- * Handles common separators like ", ", " & ", " and ".
+ * Handles common separators like ", ", " & ", " and ", but keeps a name
+ * written last name first ("Hale, Tessa") whole in a book of that language.
  */
-export const parseAuthors = (authorString: string): string[] => {
+export const parseAuthors = (authorString: string, bookLang?: string | string[]): string[] => {
   if (!authorString || !authorString.trim()) {
     return [];
   }
 
-  // Split by common separators: comma, ampersand, "and"
-  // Use regex to handle variations with different spacing
   const authors = authorString
-    .split(/\s*(?:,|&|\band\b)\s*/i)
+    .split(/\s*(?:&|\band\b)\s*/i)
+    .flatMap((part) => (isLastNameFirst(part, bookLang) ? [part] : part.split(',')))
     .map((author) => author.trim())
     .filter((author) => author.length > 0);
 
   return authors;
+};
+
+/**
+ * A book's authors. The stored author joins separate creators in the book's
+ * language ("A und B", "A y B"), and parsing that join can't tell a
+ * conjunction from a name ("José Ortega y Gasset"), so read the creators
+ * while the stored author is still their join, not a user's edit.
+ */
+const getBookAuthors = (book: Book): string[] => {
+  const creators = book.metadata?.author;
+  if (
+    Array.isArray(creators) &&
+    creators.length > 1 &&
+    formatAuthors(creators, book.primaryLanguage) === book.author
+  ) {
+    return getContributorNames(creators).flatMap((name) =>
+      parseAuthors(name, book.primaryLanguage),
+    );
+  }
+  return parseAuthors(book.author, book.primaryLanguage);
 };
 
 /**
@@ -714,7 +908,7 @@ const createAuthorGroups = (books: Book[]): (Book | BooksGroup)[] => {
       continue;
     }
 
-    const authors = parseAuthors(authorString);
+    const authors = getBookAuthors(book);
 
     if (authors.length === 0) {
       ungroupedBooks.push(book);
@@ -808,27 +1002,38 @@ export const resolveCurrentShelfBooks = (
  * For series groups: sort by seriesIndex first (always ascending), then by global sort for items without index.
  * For other groupings: when a secondary key is supplied, sort by secondary key first (in its own
  *   direction), with the primary global sort as tiebreaker. Without secondary, follow global sort setting.
+ *   A saved `sortOrder` is followed in rank order instead: it always has a rank 2, so leading
+ *   with it would make whatever sits second the in-group order (#7786).
  * @param sortAscending - When true (default), sort direction is ascending. Series index is always
  *   ascending regardless of this flag; the flag affects the fallback / primary tiebreaker only.
- * @param secondarySortBy - When non-'none', acts as the *primary* within-group ordering for
- *   non-series groupings (matches the user's mental model: "group by author, then sort by series"
- *   should land series order inside each author).
+ * @param secondarySortBy - When non-'none' and no `sortOrder` is given, acts as the *primary*
+ *   within-group ordering for non-series groupings (matches the user's mental model: "group by
+ *   author, then sort by series" should land series order inside each author, #4307).
  * @param secondaryAscending - Direction of the secondary key, independent of `sortAscending`
  *   (issue #5119).
  */
-export const createWithinGroupSorter =
-  (
-    groupBy: LibraryGroupByType,
-    sortBy: LibrarySortByType,
-    uiLanguage: string,
-    sortAscending: boolean = true,
-    secondarySortBy: LibrarySecondarySortByType = 'none',
-    secondaryAscending: boolean = true,
-    pageDurations?: Readonly<Record<string, number>>,
-  ) =>
-  (a: Book, b: Book): number => {
-    const sortDirection = sortAscending ? 1 : -1;
+export const createWithinGroupSorter = (
+  groupBy: LibraryGroupByType,
+  sortBy: LibrarySortByType,
+  uiLanguage: string,
+  sortAscending: boolean = true,
+  secondarySortBy: LibrarySecondarySortByType = 'none',
+  secondaryAscending: boolean = true,
+  pageDurations?: Readonly<Record<string, number>>,
+  sortOrder?: LibrarySortCriterion[],
+) => {
+  const hasSortOrder = Boolean(sortOrder && sortOrder.length > 0);
+  const fallbackCompare = createBookSorter(
+    sortBy,
+    uiLanguage,
+    'none',
+    sortAscending,
+    secondaryAscending,
+    pageDurations,
+    hasSortOrder ? sortOrder : undefined,
+  );
 
+  return (a: Book, b: Book): number => {
     if (groupBy === LibraryGroupByType.Series) {
       const aIndex = a.metadata?.seriesIndex;
       const bIndex = b.metadata?.seriesIndex;
@@ -843,27 +1048,26 @@ export const createWithinGroupSorter =
       if (bIndex != null) return 1;
 
       // Neither has series index - fall back to global sort with direction
-      return (
-        createBookSorter(sortBy, uiLanguage, 'none', true, true, pageDurations)(a, b) *
-        sortDirection
-      );
+      return fallbackCompare(a, b);
     }
 
     // For author and other non-series groupings: when a secondary key is provided,
     // use it as the within-group primary order with the global key as tiebreaker.
-    if (secondarySortBy !== 'none') {
-      const bySecondary = compareBookByKey(a, b, secondarySortBy, uiLanguage, pageDurations);
-      if (bySecondary !== 0) return bySecondary * (secondaryAscending ? 1 : -1);
-      return (
-        createBookSorter(sortBy, uiLanguage, 'none', true, true, pageDurations)(a, b) *
-        sortDirection
+    if (secondarySortBy !== 'none' && !hasSortOrder) {
+      const bySecondary = compareBookByCriterion(
+        a,
+        b,
+        secondarySortBy,
+        secondaryAscending,
+        uiLanguage,
+        pageDurations,
       );
+      if (bySecondary !== 0) return bySecondary;
     }
 
-    return (
-      createBookSorter(sortBy, uiLanguage, 'none', true, true, pageDurations)(a, b) * sortDirection
-    );
+    return fallbackCompare(a, b);
   };
+};
 
 /**
  * Get the sort value from a book for comparison with groups.
@@ -871,7 +1075,7 @@ export const createWithinGroupSorter =
 export const getBookSortValue = (book: Book, sortBy: LibrarySortByType): number | string => {
   switch (sortBy) {
     case LibrarySortByType.Title:
-      return formatTitle(book.title);
+      return getTitleSortValue(book);
 
     case LibrarySortByType.Author:
       return formatAuthors(book.author, book?.primaryLanguage || 'en', true);
@@ -888,10 +1092,11 @@ export const getBookSortValue = (book: Book, sortBy: LibrarySortByType): number 
     case LibrarySortByType.Progress:
       return getBookReadRatio(book);
 
+    case LibrarySortByType.Pages:
+      return getBookPageCount(book) ?? 0;
+
     case LibrarySortByType.Published: {
-      const published = book.metadata?.published;
-      if (!published) return 0;
-      const publishedTime = new Date(published).getTime();
+      const publishedTime = new Date(book.metadata?.published || UNDATED_PUBLISHED).getTime();
       return isNaN(publishedTime) ? 0 : publishedTime;
     }
 
@@ -913,13 +1118,18 @@ export const getGroupSortValue = (
   groupBy?: LibraryGroupByType,
 ): number | string => {
   const books = group.books;
+  // A subgroup's name is its full path ("Languages/Chinese"); it sorts among
+  // the parent group's books by its own name, as it is shown (#7062).
+  const shownName = groupBy === LibraryGroupByType.Group ? group.displayName : group.name;
+  // Under Title, "The Expanse" sorts under E, as a book with that title would (#7786).
+  const name = sortBy === LibrarySortByType.Title ? stripLeadingArticle(shownName) : shownName;
 
   if (books.length === 0) {
     return sortBy === LibrarySortByType.Title ||
       sortBy === LibrarySortByType.Series ||
       sortBy === LibrarySortByType.Author ||
       sortBy === LibrarySortByType.Format
-      ? group.name
+      ? name
       : 0;
   }
 
@@ -927,7 +1137,7 @@ export const getGroupSortValue = (
     case LibrarySortByType.Title:
     case LibrarySortByType.Series:
     case LibrarySortByType.Format:
-      return group.name;
+      return name;
 
     case LibrarySortByType.Author: {
       if (groupBy === LibraryGroupByType.Author) {
@@ -940,7 +1150,7 @@ export const getGroupSortValue = (
         return formatAuthors(firstBook.author, firstBook.primaryLanguage || 'en', true);
       }
       // Custom/other groups: fall back to group name
-      return group.name;
+      return name;
     }
 
     case LibrarySortByType.Updated:
@@ -955,6 +1165,10 @@ export const getGroupSortValue = (
       // Return the most-progressed book's read ratio
       return Math.max(...books.map((b) => getBookReadRatio(b)));
 
+    case LibrarySortByType.Pages:
+      // Return the group's total page count
+      return books.reduce((sum, b) => sum + (getBookPageCount(b) ?? 0), 0);
+
     case LibrarySortByType.Published: {
       // Return the most recent published date
       const publishedDates = books
@@ -963,7 +1177,9 @@ export const getGroupSortValue = (
         .map((d) => new Date(d).getTime())
         .filter((t) => !isNaN(t));
 
-      return publishedDates.length > 0 ? Math.max(...publishedDates) : 0;
+      return publishedDates.length > 0
+        ? Math.max(...publishedDates)
+        : new Date(UNDATED_PUBLISHED).getTime();
     }
 
     case LibrarySortByType.TimeRemaining:
@@ -982,14 +1198,18 @@ export const compareSortValues = (
   aValue: number | string,
   bValue: number | string,
   uiLanguage: string,
+  sortBy?: LibrarySortByType,
 ): number => {
   // String comparison for text-based sorts
   if (typeof aValue === 'string' && typeof bValue === 'string') {
-    return aValue.localeCompare(bValue, uiLanguage || navigator.language);
+    return sortBy === LibrarySortByType.Title
+      ? compareTitles(aValue, bValue, uiLanguage)
+      : aValue.localeCompare(bValue, uiLanguage || navigator.language);
   }
 
   // Numeric comparison for date-based sorts
   if (typeof aValue === 'number' && typeof bValue === 'number') {
+    if (aValue === bValue || (!Number.isFinite(aValue) && !Number.isFinite(bValue))) return 0;
     return aValue - bValue;
   }
 
@@ -1005,17 +1225,7 @@ export const createGroupSorter =
     const aValue = getGroupSortValue(a, sortBy, groupBy);
     const bValue = getGroupSortValue(b, sortBy, groupBy);
 
-    // String comparison for text-based sorts
-    if (typeof aValue === 'string' && typeof bValue === 'string') {
-      return aValue.localeCompare(bValue, uiLanguage || navigator.language);
-    }
-
-    // Numeric comparison for date-based sorts
-    if (typeof aValue === 'number' && typeof bValue === 'number') {
-      return aValue - bValue;
-    }
-
-    return 0;
+    return compareSortValues(aValue, bValue, uiLanguage, sortBy);
   };
 
 export type BookContextMenuItemId =
@@ -1179,4 +1389,10 @@ export const getBookContextMenuItemIds = (
   }
   ids.push('delete');
   return ids;
+};
+
+/** The group every book shares, or undefined when they don't share one. */
+export const getCommonGroupName = (books: Book[]): string | undefined => {
+  const name = books[0]?.groupName;
+  return name && books.every((book) => book.groupName === name) ? name : undefined;
 };

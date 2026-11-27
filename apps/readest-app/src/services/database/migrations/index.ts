@@ -47,6 +47,33 @@ const migrations: Record<SchemaType, MigrationEntry[]> = {
       `,
     },
   ],
+  'grimmory-sync': [
+    {
+      name: '2026110501_grimmory_sync',
+      sql: `
+        CREATE TABLE IF NOT EXISTS grimmory_books (
+          account TEXT NOT NULL,
+          book_hash TEXT NOT NULL,
+          book_id INTEGER NOT NULL,
+          book_file_id INTEGER NOT NULL,
+          book_type TEXT,
+          is_primary INTEGER NOT NULL,
+          status_pushed_at INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (account, book_hash)
+        );
+
+        CREATE TABLE IF NOT EXISTS grimmory_note_links (
+          account TEXT NOT NULL,
+          book_hash TEXT NOT NULL,
+          note_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          server_id INTEGER NOT NULL,
+          local_updated_at INTEGER NOT NULL,
+          PRIMARY KEY (account, book_hash, kind, note_id)
+        );
+      `,
+    },
+  ],
   'hardcover-sync': [
     {
       name: '2026032901_hardcover_note_mappings',
@@ -104,6 +131,20 @@ const migrations: Record<SchemaType, MigrationEntry[]> = {
   // and text search now comes from the per-book library-search schema below.
   // Future Reedy schema keeps embeddings only, with chunks defined as
   // locator ranges into search_sections.
+  xray: [
+    {
+      name: '2026112401_xray_batches',
+      sql: `
+        CREATE TABLE IF NOT EXISTS xray_batches (
+          book_hash TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          end_cfi TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          PRIMARY KEY (book_hash, position)
+        );
+      `,
+    },
+  ],
   statistics: [
     {
       name: '2026061501_statistics_koreader_schema',
@@ -165,6 +206,19 @@ const migrations: Record<SchemaType, MigrationEntry[]> = {
 
         CREATE TABLE IF NOT EXISTS readest_stat_sync_state (
           key text PRIMARY KEY, value integer NOT NULL DEFAULT 0
+        );
+      `,
+    },
+    {
+      name: '2026111901_statistics_reading_speed',
+      sql: `
+        CREATE TABLE IF NOT EXISTS readest_reading_speed (
+          start_time_ms integer NOT NULL,
+          book_md5 text NOT NULL,
+          unit text NOT NULL CHECK (unit IN ('characters', 'words')),
+          count integer NOT NULL CHECK (count > 0),
+          duration_ms integer NOT NULL CHECK (duration_ms > 0),
+          PRIMARY KEY (start_time_ms, book_md5, unit)
         );
       `,
     },

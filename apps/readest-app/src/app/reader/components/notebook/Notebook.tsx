@@ -1,11 +1,12 @@
 import clsx from 'clsx';
+import dynamic from 'next/dynamic';
 import React, { useCallback, useEffect, useState } from 'react';
 
 import { useSettingsStore } from '@/store/settingsStore';
-import { useBookDataStore } from '@/store/bookDataStore';
+import { useBookDataStore, useBookData, useBookConfig } from '@/store/bookDataStore';
 import { useReaderStore } from '@/store/readerStore';
 import { useSidebarStore } from '@/store/sidebarStore';
-import { useNotebookStore } from '@/store/notebookStore';
+import { NotebookTab, useNotebookStore } from '@/store/notebookStore';
 import { useAIChatStore } from '@/store/aiChatStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useThemeStore } from '@/store/themeStore';
@@ -25,9 +26,12 @@ import {
   useNotebookDocumentCoordinator,
 } from '../../hooks/useNotebookDocumentCoordinator';
 import AIAssistant from './AIAssistant';
+import DictionaryView from './DictionaryView';
 import NotebookHeader from './Header';
 import NotebookEditor from './NotebookEditor';
 import NotebookTabNavigation from './NotebookTabNavigation';
+
+const XRayView = dynamic(() => import('./XRayView'), { ssr: false });
 
 const MIN_NOTEBOOK_WIDTH = 0.15;
 const MAX_NOTEBOOK_WIDTH = 0.45;
@@ -52,14 +56,18 @@ const Notebook: React.FC = () => {
     toggleNotebookPin,
     setNotebookActiveTab,
   } = useNotebookStore();
-  const { getBookData, getConfig, setConfig, updateBooknotes, saveConfig } = useBookDataStore();
+  const getConfig = useBookDataStore((s) => s.getConfig);
+  const setConfig = useBookDataStore((s) => s.setConfig);
+  const updateBooknotes = useBookDataStore((s) => s.updateBooknotes);
+  const saveConfig = useBookDataStore((s) => s.saveConfig);
   const { getViewSettings } = useReaderStore();
   const { activeConversationId } = useAIChatStore();
 
   useNotebookDocumentCoordinator(sideBarBookKey);
 
-  const isMobile =
-    appService?.isMobile === true || window.innerWidth < 640 || window.innerHeight < 640;
+  // As the sidebar decides it: a sheet on a phone-width window, and on a
+  // tablet a panel that can pin beside the page (#7730).
+  const isMobile = window.innerWidth < 640;
   const [isFullHeightInMobile, setIsFullHeightInMobile] = useState(isMobile);
 
   const hideNotebook = useCallback(() => {
@@ -83,9 +91,18 @@ const Notebook: React.FC = () => {
 
   useShortcuts({ onEscape: handleHideNotebookShortcut }, [handleHideNotebookShortcut]);
 
+  const isEink =
+    (sideBarBookKey ? getViewSettings(sideBarBookKey)?.isEink : undefined) ??
+    settings.globalViewSettings?.isEink;
+
+  useEffect(() => {
+    if (isNotebookVisible) updateAppTheme(isEink ? 'base-100' : 'base-200');
+  }, [isNotebookVisible, isEink, updateAppTheme]);
+
+  // Only a visibility change resets the color: an e-ink change while hidden
+  // must not repaint over an open sidebar.
   useEffect(() => {
     if (isNotebookVisible) {
-      updateAppTheme('base-200');
       overlayRef.current = document.querySelector('.overlay') as HTMLDivElement | null;
     } else {
       updateAppTheme('base-100');
@@ -95,8 +112,10 @@ const Notebook: React.FC = () => {
 
   useEffect(() => {
     setNotebookWidth(settings.globalReadSettings.notebookWidth);
-    setNotebookPin(settings.globalReadSettings.isNotebookPinned);
-    setNotebookVisible(settings.globalReadSettings.isNotebookPinned);
+    // As the sidebar does, a phone opens the book without the pinned panel over it.
+    const pinned = !isMobile && settings.globalReadSettings.isNotebookPinned;
+    setNotebookPin(pinned);
+    setNotebookVisible(pinned);
     if (settings.globalReadSettings.notebookActiveTab) {
       setNotebookActiveTab(settings.globalReadSettings.notebookActiveTab);
     }
@@ -119,6 +138,8 @@ const Notebook: React.FC = () => {
 
   const handleTogglePin = () => {
     toggleNotebookPin();
+    // As the sidebar does: an unpinned Notebook would float over the page.
+    if (isNotebookPinned) hideNotebook();
     const globalReadSettings = settings.globalReadSettings;
     saveSysSettings(envConfig, 'globalReadSettings', {
       ...globalReadSettings,
@@ -126,7 +147,7 @@ const Notebook: React.FC = () => {
     });
   };
 
-  const handleTabChange = (tab: 'notes' | 'ai') => {
+  const handleTabChange = (tab: NotebookTab) => {
     setNotebookActiveTab(tab);
     saveSysSettings(envConfig, 'globalReadSettings', {
       ...settings.globalReadSettings,
@@ -173,9 +194,10 @@ const Notebook: React.FC = () => {
       onResize: handleNotebookResize,
     });
 
+  const bookData = useBookData(sideBarBookKey);
+  const bookConfig = useBookConfig(sideBarBookKey);
   if (!sideBarBookKey) return null;
-  const bookData = getBookData(sideBarBookKey);
-  const excerptNotes = (getConfig(sideBarBookKey)?.booknotes ?? [])
+  const excerptNotes = (bookConfig?.booknotes ?? [])
     .filter((note) => note.type === 'excerpt' && note.text && !note.deletedAt)
     .sort((a, b) => a.createdAt - b.createdAt);
   const viewSettings = getViewSettings(sideBarBookKey);
@@ -198,7 +220,8 @@ const Notebook: React.FC = () => {
           viewSettings?.isEink ? 'bg-base-100' : 'bg-base-200',
           appService?.hasRoundedWindow && 'rounded-window-top-right rounded-window-bottom-right',
           isNotebookPinned ? 'z-20' : 'z-[45] shadow-2xl',
-          !isNotebookPinned && viewSettings?.isEink && 'border-base-content border-s',
+          // Physical edge: the notebook sits on the right whatever the book's `dir`.
+          viewSettings?.isEink && 'border-base-content border-l',
         )}
         role='group'
         aria-label={_('Notebook')}
@@ -257,6 +280,8 @@ const Notebook: React.FC = () => {
             </div>
           )}
           <NotebookHeader
+            bookKey={sideBarBookKey}
+            activeTab={notebookActiveTab}
             isPinned={isNotebookPinned}
             isFullScreenMobile={isMobile && isFullHeightInMobile}
             handleClose={hideNotebook}
@@ -267,6 +292,10 @@ const Notebook: React.FC = () => {
           <div className='flex min-h-0 flex-1 flex-col'>
             <AIAssistant key={activeConversationId ?? 'new'} bookKey={sideBarBookKey} />
           </div>
+        ) : notebookActiveTab === 'dictionary' ? (
+          <DictionaryView />
+        ) : notebookActiveTab === 'xray' ? (
+          <XRayView key={sideBarBookKey} bookKey={sideBarBookKey} />
         ) : (
           <NotebookEditor
             bookKey={sideBarBookKey}

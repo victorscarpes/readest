@@ -1,12 +1,17 @@
 import type { FoliateView } from '@/types/view';
 
 // Heuristically classify a link as a possible footnote marker based on its
-// text content. The bare numeric pattern matches things like `1`, `12`, `a1`,
-// `[1`, which are common when a book formats footnotes as plain digits.
-const NUMERIC_MARKER_RE = /^.{0,2}\d+$/;
+// text content. Matches plain digits (1, 12), prefixed/bracketed digits
+// (a1, [1], (1), [1), CJK full-width digits/brackets (（注1）, 【2】, ［1］, 〖2〗, 25）),
+// translation/editor note prefixes (注1, 註1, 訳注1, 訳註1, 原注2, 編注3), note ranges (61～69）),
+// circled numbers (①〜⑳), and common footnote symbols with optional numbers (＊, ＊1, *, *1, ※, ※1, †, ‡).
+const FOOTNOTE_MARKER_RE =
+  /^[（(［\[【〔〈〖]?\s*(?:[＊*※†‡]\s*[0-9０-９]*|(?:[a-zA-Z]{1,2}|(?:訳|原|編)?[注註](?:釈)?|Notes?)\s*[0-9０-９]+(?:[〜～~-][0-9０-９]+)?|[①-⑳㉑-㊿]|[0-9０-９]+(?:[〜～~-][0-9０-９]+)?)\s*[）)］\]】〕〉〗]?$/i;
 
-const isNumericMarkerText = (text: string | null | undefined) =>
-  text != null && NUMERIC_MARKER_RE.test(text.trim());
+const isFootnoteMarkerText = (text: string | null | undefined) =>
+  text != null && FOOTNOTE_MARKER_RE.test(text.trim());
+
+const isNumericMarkerText = isFootnoteMarkerText;
 
 // Books with in-book navigation (TOC, chapter/verse indexes) often render a
 // flat list of short numeric links: `<a>1</a>, <a>2</a>, ...`. Those should
@@ -39,6 +44,23 @@ export const shouldCheckAsFootnote = (anchor: HTMLAnchorElement): boolean => {
     container = container.parentElement;
   }
   return true;
+};
+
+// A note marker the book declares. An XHTML section keeps `epub:type`
+// namespaced, an HTML one as a plain attribute.
+const DECLARED_NOTE_REF =
+  'a[href][*|type~="noteref"], a[href][epub\\:type~="noteref"], a[href][role~="doc-noteref"]';
+
+// A cross-reference in the text (`〔原注47参照〕`) is a plain link to a note
+// whose own marker sits elsewhere in the chapter. Report whether a declared
+// marker points where the link does, so the link opens that note as the
+// marker does (#7982).
+export const linksToDeclaredNote = (anchor: HTMLAnchorElement): boolean => {
+  const href = anchor.getAttribute('href');
+  if (!href?.includes('#')) return false;
+  return Array.from(anchor.ownerDocument.querySelectorAll(DECLARED_NOTE_REF)).some(
+    (marker) => marker.getAttribute('href') === href,
+  );
 };
 
 // The reader hides inline footnote bodies in `getLayoutStyles`

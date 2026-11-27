@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { getRuntimeConfig } from '@/services/runtimeConfig';
+import { withAuthRequestTimeout } from './authRequestTimeout';
 
 const supabaseUrl =
   getRuntimeConfig()?.supabaseUrl ||
@@ -12,7 +13,52 @@ const supabaseAnonKey =
   process.env['NEXT_PUBLIC_SUPABASE_ANON_KEY'] ||
   atob(process.env['NEXT_PUBLIC_DEFAULT_SUPABASE_KEY_BASE64']!);
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+// supabase-js persists the session under a key derived from the URL's first
+// host label. Readest Cloud keeps the key from its original host so moving the
+// client to another of its hosts doesn't sign everyone out.
+const READEST_CLOUD_HOSTS = [
+  'readest.supabase.co',
+  'vbsyxfusjjqdxkjqlysc.supabase.co',
+  'auth.readest.com',
+];
+
+// Some ISPs block *.supabase.co (#6416), so Readest Cloud sends password sign-in
+// and the calls that keep such a session alive through a Worker on readest.com
+// (workers/auth-proxy). OAuth and email links stay on the Supabase host: their
+// callbacks land there, and a proxy can't change that.
+const AUTH_PROXY_URL = 'https://auth-cf.readest.com';
+
+const isProxiedAuthRequest = ({ pathname, searchParams }: URL) =>
+  pathname === '/auth/v1/logout' ||
+  (pathname === '/auth/v1/token' &&
+    ['password', 'refresh_token'].includes(searchParams.get('grant_type') ?? ''));
+
+const authFetch = withAuthRequestTimeout((input, init) => fetch(input, init));
+
+// A network that can't reach the proxy host (a filter that blocks the new
+// domain) goes to the Supabase host instead, as before the proxy existed;
+// otherwise every refresh fails and the reader is signed out (#7538). Only a
+// failed or timed-out connection falls back: an answer from the proxy is final.
+// Each attempt gets its own time limit, so a proxy that never answers still
+// leaves time for the Supabase host.
+const proxyAuthFetch: typeof fetch = async (input, init) => {
+  const url = new URL(input instanceof Request ? input.url : input);
+  if (!isProxiedAuthRequest(url)) return authFetch(input, init);
+  try {
+    return await authFetch(`${AUTH_PROXY_URL}${url.pathname}${url.search}`, init);
+  } catch (error) {
+    if (init?.signal?.aborted) throw error;
+    return authFetch(input, init);
+  }
+};
+
+export const supabase = createClient(
+  supabaseUrl,
+  supabaseAnonKey,
+  READEST_CLOUD_HOSTS.includes(new URL(supabaseUrl).hostname)
+    ? { auth: { storageKey: 'sb-readest-auth-token' }, global: { fetch: proxyAuthFetch } }
+    : { global: { fetch: authFetch } },
+);
 
 export const createSupabaseClient = (accessToken?: string) => {
   return createClient(supabaseUrl, supabaseAnonKey, {

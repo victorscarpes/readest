@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // When a user upgrades Plus -> Pro on Stripe, both subscriptions stay active
@@ -70,6 +71,13 @@ vi.mock('@/utils/supabase', () => ({
               maybeSingle: () =>
                 Promise.resolve({ data: { stripe_customer_id: 'cus_1' }, error: null }),
             }),
+          }),
+        };
+      }
+      if (table === 'gift_cards') {
+        return {
+          select: () => ({
+            eq: () => ({ eq: () => Promise.resolve({ data: [], error: null }) }),
           }),
         };
       }

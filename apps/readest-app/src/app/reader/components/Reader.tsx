@@ -24,6 +24,8 @@ import { mountAdditionalFonts } from '@/styles/fonts';
 import { isTauriAppPlatform } from '@/services/environment';
 import { getSysFontsList, setSystemUIVisibility } from '@/utils/bridge';
 import { AboutWindow } from '@/components/AboutWindow';
+import ReadingStatsDialog from '@/components/stats/ReadingStatsDialog';
+import { VocabularyDialog } from '@/components/vocabulary/VocabularyDialog';
 import { KeyboardShortcutsHelp } from '@/components/KeyboardShortcutsHelp';
 import { UpdaterWindow } from '@/components/UpdaterWindow';
 import { ProofreadRulesManager } from './ProofreadRules';
@@ -156,16 +158,23 @@ const Reader: React.FC<{ ids?: string }> = ({ ids }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hoveredBookKey]);
 
+  const isWebPwa = appService?.appPlatform === 'web' && appService.hasSafeAreaInset;
+
   return libraryLoaded && settings.globalReadSettings ? (
     <div
       className={clsx(
         'reader-page bg-base-100 text-base-content full-height select-none overflow-hidden',
+        isWebPwa && 'fixed inset-0',
         appService?.hasRoundedWindow && isRoundedWindow && 'window-border rounded-window',
       )}
     >
-      <Suspense fallback={<div className='full-height'></div>}>
+      <Suspense
+        fallback={<div className={clsx('full-height bg-base-100', isWebPwa && 'fixed inset-0')} />}
+      >
         <ReaderContent ids={ids} settings={settings} />
         <AboutWindow />
+        <ReadingStatsDialog />
+        <VocabularyDialog />
         <KeyboardShortcutsHelp />
         <UpdaterWindow />
         <ProofreadRulesManager />
@@ -173,7 +182,7 @@ const Reader: React.FC<{ ids?: string }> = ({ ids }) => {
       </Suspense>
     </div>
   ) : (
-    <div className='full-height bg-base-100'></div>
+    <div className={clsx('full-height bg-base-100', isWebPwa && 'fixed inset-0')}></div>
   );
 };
 

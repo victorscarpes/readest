@@ -1,6 +1,6 @@
 import clsx from 'clsx';
 import React, { useEffect, useState } from 'react';
-import { PiUserCircle, PiUserCircleCheck, PiGear } from 'react-icons/pi';
+import { PiUserCircle, PiUserCircleCheck, PiGear, PiChartBar, PiCardsThree } from 'react-icons/pi';
 import { PiSun, PiMoon } from 'react-icons/pi';
 import { TbSunMoon } from 'react-icons/tb';
 import { MdCloudSync, MdSync, MdSyncProblem, MdOutlineSensors } from 'react-icons/md';
@@ -8,13 +8,15 @@ import { MdCloudSync, MdSync, MdSyncProblem, MdOutlineSensors } from 'react-icon
 import { useAppRouter } from '@/hooks/useAppRouter';
 import { isTauriAppPlatform, isWebAppPlatform } from '@/services/environment';
 import { DOWNLOAD_READEST_URL } from '@/services/constants';
+import { setReadingStatsDialogVisible } from '@/components/stats/ReadingStatsDialog';
+import { setVocabularyDialogVisible } from '@/components/vocabulary/VocabularyDialog';
 import { setBackupDialogVisible } from '@/app/library/components/BackupWindow';
 import { setCacheManagerDialogVisible } from '@/app/library/components/CacheManagerWindow';
 import { useAuth } from '@/context/AuthContext';
 import { useEnv } from '@/context/EnvContext';
 import { useThemeStore } from '@/store/themeStore';
 import { useQuotaStats } from '@/hooks/useQuotaStats';
-import { isReadestCloudEnabled } from '@/services/sync/cloudSyncProvider';
+import { useUserActions } from '@/hooks/useUserActions';
 import { useLibraryStore } from '@/store/libraryStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useTranslation } from '@/hooks/useTranslation';
@@ -22,7 +24,7 @@ import { useCloudSyncStatus } from '@/hooks/useCloudSyncStatus';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { useTransferQueue } from '@/hooks/useTransferQueue';
 import { navigateToLogin, navigateToProfile } from '@/utils/nav';
-import { tauriHandleSetAlwaysOnTop, tauriHandleToggleFullScreen } from '@/utils/window';
+import { canToggleFullScreen, tauriHandleSetAlwaysOnTop, toggleFullScreen } from '@/utils/window';
 import { setAboutDialogVisible } from '@/components/AboutWindow';
 import { setMigrateDataDirDialogVisible } from '@/app/library/components/MigrateDataWindow';
 import { requestStoragePermission } from '@/utils/permission';
@@ -51,10 +53,10 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
   const { envConfig, appService } = useEnv();
   const { user } = useAuth();
   const { userProfilePlan, quotas } = useQuotaStats(true);
+  const { handleLogout } = useUserActions();
   const { themeMode, setThemeMode } = useThemeStore();
   const { settings, setSettingsDialogOpen } = useSettingsStore();
   const [isAlwaysOnTop, setIsAlwaysOnTop] = useState(settings.alwaysOnTop);
-  const [isAlwaysShowStatusBar, setIsAlwaysShowStatusBar] = useState(settings.alwaysShowStatusBar);
   const [isOpenLastBooks, setIsOpenLastBooks] = useState(settings.openLastBooks);
   const [isAutoImportBooksOnOpen, setIsAutoImportBooksOnOpen] = useState(
     settings.autoImportBooksOnOpen,
@@ -121,9 +123,14 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
     setIsDropdownOpen?.(false);
   };
 
-  const handleManageSync = () => {
-    router.push('/user?section=sync');
+  const handleSyncSettings = () => {
+    navigateToProfile(router, 'sync');
     setIsDropdownOpen?.(false);
+  };
+
+  const onLogout = () => {
+    setIsDropdownOpen?.(false);
+    void handleLogout();
   };
 
   const cycleThemeMode = () => {
@@ -131,7 +138,7 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
   };
 
   const handleFullScreen = () => {
-    tauriHandleToggleFullScreen();
+    toggleFullScreen(appService);
     setIsDropdownOpen?.(false);
   };
 
@@ -146,12 +153,6 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
     setIsAlwaysOnTop(newValue);
     tauriHandleSetAlwaysOnTop(newValue);
     setIsDropdownOpen?.(false);
-  };
-
-  const toggleAlwaysShowStatusBar = () => {
-    const newValue = !settings.alwaysShowStatusBar;
-    saveSysSettings(envConfig, 'alwaysShowStatusBar', newValue);
-    setIsAlwaysShowStatusBar(newValue);
   };
 
   const toggleAutoImportBooksOnOpen = () => {
@@ -222,6 +223,16 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
     }
   };
 
+  const openReadingStats = () => {
+    setIsDropdownOpen?.(false);
+    setReadingStatsDialogVisible(true);
+  };
+
+  const openVocabulary = () => {
+    setIsDropdownOpen?.(false);
+    setVocabularyDialogVisible(true);
+  };
+
   const openSettingsDialog = () => {
     setIsDropdownOpen?.(false);
     setSettingsDialogOpen(true);
@@ -265,7 +276,6 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
   // The sync row reports the health of whatever the user selected. Native
   // cursors freeze while Readest Cloud is off (the book/progress/note channels
   // are gated), so the file engine's timestamps have to stand in.
-  const readestEnabled = isReadestCloudEnabled(settings);
   // Shared with the reader's View menu (#5910) so both surfaces answer "is my
   // sync healthy?" identically. The hook gates the native cursors on whether
   // Readest Cloud is actually enabled and drops backends that cannot run right
@@ -311,21 +321,6 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
         >
           <ul className='ms-0 flex flex-col ps-0 before:hidden'>
             <MenuItem
-              label={_('Cloud File Transfers')}
-              Icon={MdCloudSync}
-              description={
-                hasActiveTransfers
-                  ? _('{{activeCount}} active, {{pendingCount}} pending', {
-                      activeCount: stats.active,
-                      pendingCount: stats.pending,
-                    })
-                  : stats.failed > 0
-                    ? _('{{failedCount}} failed', { failedCount: stats.failed })
-                    : ''
-              }
-              onClick={openTransferQueue}
-            />
-            <MenuItem
               label={syncStatus.label}
               Icon={syncStatus.needsSignIn || syncStatus.failed ? MdSyncProblem : MdSync}
               labelClass='ps-2 pe-1 mx-0!'
@@ -349,7 +344,7 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
                       })
               }
             />
-            {readestEnabled ? (
+            {quotas.length > 0 && (
               <button
                 onClick={handleUserProfile}
                 className='hover:bg-base-300 w-full rounded-md'
@@ -357,16 +352,33 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
                   paddingInlineStart: `${iconSize}px`,
                 }}
               >
-                <Quota quotas={quotas} labelClassName='h-10 pl-3 pr-2' />
+                <Quota quotas={quotas} labelClassName='h-10 ps-3 pe-2' />
               </button>
-            ) : null}
+            )}
             <MenuItem label={_('Account')} onClick={handleUserProfile} />
+            <MenuItem label={_('Sign Out')} onClick={onLogout} />
+            <MenuItem label={_('Sync Settings')} onClick={handleSyncSettings} />
           </ul>
         </MenuItem>
       ) : (
         <MenuItem label={_('Sign In')} Icon={PiUserCircle} onClick={handleUserLogin}></MenuItem>
       )}
 
+      <MenuItem
+        label={_('Cloud File Transfers')}
+        Icon={MdCloudSync}
+        description={
+          hasActiveTransfers
+            ? _('{{activeCount}} active, {{pendingCount}} pending', {
+                activeCount: stats.active,
+                pendingCount: stats.pending,
+              })
+            : stats.failed > 0
+              ? _('{{failedCount}} failed', { failedCount: stats.failed })
+              : ''
+        }
+        onClick={openTransferQueue}
+      />
       {isTauriAppPlatform() && (
         <MenuItem
           label={_('Auto Import on File Open')}
@@ -389,16 +401,11 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
           onClick={toggleOpenInNewWindow}
         />
       )}
-      {appService?.hasWindow && <MenuItem label={_('Fullscreen')} onClick={handleFullScreen} />}
+      {canToggleFullScreen(appService) && (
+        <MenuItem label={_('Fullscreen')} onClick={handleFullScreen} />
+      )}
       {appService?.hasWindow && (
         <MenuItem label={_('Always on Top')} toggled={isAlwaysOnTop} onClick={toggleAlwaysOnTop} />
-      )}
-      {appService?.isMobileApp && (
-        <MenuItem
-          label={_('Always Show Status Bar')}
-          toggled={isAlwaysShowStatusBar}
-          onClick={toggleAlwaysShowStatusBar}
-        />
       )}
       <MenuItem
         label={themeModeLabel}
@@ -413,6 +420,8 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
         }
         onClick={cycleThemeMode}
       />
+      <MenuItem label={_('Reading Statistics')} Icon={PiChartBar} onClick={openReadingStats} />
+      <MenuItem label={_('Vocabulary')} Icon={PiCardsThree} onClick={openVocabulary} />
       <MenuItem label={_('Settings')} Icon={PiGear} onClick={openSettingsDialog} />
       <hr aria-hidden='true' className='border-base-200 my-1' />
       <MenuItem label={_('Advanced Settings')}>
@@ -421,14 +430,13 @@ const SettingsMenu: React.FC<SettingsMenuProps> = ({ onPullLibrary, setIsDropdow
           {appService?.canCustomizeRootDir && (
             <MenuItem label={_('Change Data Location')} onClick={handleSetRootDir} />
           )}
-          {user && <MenuItem label={_('Data Sync')} onClick={handleManageSync} />}
           <MenuItem
             label={_('Refresh Metadata')}
             description={refreshMetadataProgress}
             onClick={handleRefreshMetadata}
             disabled={isRefreshingMetadata}
           />
-          {appService?.isMobileApp && (
+          {(appService?.isMobileApp || appService?.isDesktopApp) && (
             <MenuItem label={_('Manage Cache')} onClick={handleManageCache} />
           )}
           {!isPinEnabled && (

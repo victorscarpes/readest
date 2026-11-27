@@ -1,9 +1,18 @@
+// @vitest-environment happy-dom
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, cleanup, screen, fireEvent } from '@testing-library/react';
+import { render, cleanup, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
+import { invoke } from '@tauri-apps/api/core';
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
+const platform = vi.hoisted(() => ({
+  isWindowsApp: false,
+  isMobileApp: false,
+  hasOrientationLock: false,
+}));
 
 /**
- * Settings > Behavior > Device switches: Gamepad Support (issue #5979) and
- * Hide Bookshelf Buttons.
+ * Settings > Behavior > Device: Gamepad Support (issue #5979), Hide Bookshelf
+ * Buttons and Orientation.
  *
  * Gamepad Support (issue #5979).
  *
@@ -17,7 +26,7 @@ const sysSettings: Record<string, unknown> = { gamepadEnabled: true };
 const view = { bookEink: false, globalEink: false };
 
 vi.mock('@/context/EnvContext', () => ({
-  useEnv: () => ({ envConfig: {}, appService: { isMobileApp: false } }),
+  useEnv: () => ({ envConfig: {}, appService: { ...platform } }),
 }));
 
 vi.mock('@/hooks/useTranslation', () => ({
@@ -32,6 +41,7 @@ vi.mock('@/store/readerStore', () => ({
       scrolled: false,
       noContinuousScroll: false,
       isEink: view.bookEink,
+      screenOrientation: 'auto',
     }),
     recreateViewer: vi.fn(),
   }),
@@ -58,9 +68,16 @@ vi.mock('@/hooks/useEinkMode', () => ({
 }));
 
 const saveSysSettings = vi.fn();
+const saveViewSettings = vi.fn();
 vi.mock('@/helpers/settings', () => ({
-  saveViewSettings: vi.fn(),
+  saveViewSettings: (...args: unknown[]) => saveViewSettings(...args),
   saveSysSettings: (...args: unknown[]) => saveSysSettings(...args),
+}));
+
+const lockScreenOrientation = vi.fn();
+vi.mock('@/utils/bridge', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/utils/bridge')>()),
+  lockScreenOrientation: (...args: unknown[]) => lockScreenOrientation(...args),
 }));
 
 vi.mock('@/services/environment', () => ({
@@ -102,9 +119,89 @@ const gamepadSwitch = () =>
 afterEach(() => {
   cleanup();
   saveSysSettings.mockClear();
+  saveViewSettings.mockClear();
+  lockScreenOrientation.mockClear();
   sysSettings['gamepadEnabled'] = true;
   view.bookEink = false;
   view.globalEink = false;
+  platform.isWindowsApp = false;
+  platform.isMobileApp = false;
+  platform.hasOrientationLock = false;
+  vi.mocked(invoke).mockReset();
+});
+
+const thumbnailSwitch = () =>
+  document.querySelector<HTMLInputElement>(
+    '[data-setting-id="settings.control.explorerThumbnails"] input',
+  )!;
+
+describe('Windows Explorer thumbnail preference (#7206)', () => {
+  it('is hidden outside the Windows app and does not query the registry', () => {
+    render(<ControlPanel bookKey='test' onRegisterReset={() => {}} />);
+    expect(screen.queryByText('Use Readest for File Explorer thumbnails')).toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('starts off, persists an explicit opt-in, and reloads the device preference', async () => {
+    platform.isWindowsApp = true;
+    let enabled = false;
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === 'get_explorer_thumbnails_enabled') return enabled;
+      if (command === 'set_explorer_thumbnails_enabled') {
+        enabled = (args as { enabled: boolean }).enabled;
+        return;
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+    const panel = render(<ControlPanel bookKey='test' onRegisterReset={() => {}} />);
+    await waitFor(() => expect(thumbnailSwitch().disabled).toBe(false));
+    expect(thumbnailSwitch().checked).toBe(false);
+    fireEvent.click(thumbnailSwitch());
+    await waitFor(() => expect(thumbnailSwitch().checked).toBe(true));
+    expect(invoke).toHaveBeenCalledWith('set_explorer_thumbnails_enabled', { enabled: true });
+    expect(saveSysSettings).not.toHaveBeenCalled();
+    panel.unmount();
+    render(<ControlPanel bookKey='test' onRegisterReset={() => {}} />);
+    await waitFor(() => expect(thumbnailSwitch().checked).toBe(true));
+    fireEvent.click(thumbnailSwitch());
+    await waitFor(() => expect(thumbnailSwitch().checked).toBe(false));
+    expect(invoke).toHaveBeenCalledWith('set_explorer_thumbnails_enabled', { enabled: false });
+  });
+
+  it('allows an explicit opt-in after the initial preference read fails', async () => {
+    platform.isWindowsApp = true;
+    vi.mocked(invoke).mockRejectedValueOnce(new Error('Invalid registry value'));
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    render(<ControlPanel bookKey='test' onRegisterReset={() => {}} />);
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    expect(thumbnailSwitch().disabled).toBe(false);
+    fireEvent.click(thumbnailSwitch());
+    await waitFor(() => expect(thumbnailSwitch().checked).toBe(true));
+    expect(invoke).toHaveBeenCalledWith('set_explorer_thumbnails_enabled', { enabled: true });
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('keeps the saved value while a write is pending and after a failed write', async () => {
+    platform.isWindowsApp = true;
+    let rejectWrite: (error: Error) => void = () => {};
+    vi.mocked(invoke).mockImplementation((command) => {
+      if (command === 'get_explorer_thumbnails_enabled') return Promise.resolve(true);
+      return new Promise((_resolve, reject) => {
+        rejectWrite = reject;
+      });
+    });
+    render(<ControlPanel bookKey='test' onRegisterReset={() => {}} />);
+    await waitFor(() => expect(thumbnailSwitch().checked).toBe(true));
+    fireEvent.click(thumbnailSwitch());
+    expect(thumbnailSwitch().disabled).toBe(true);
+    expect(thumbnailSwitch().checked).toBe(true);
+    await act(async () => rejectWrite(new Error('Access denied')));
+    expect(thumbnailSwitch().checked).toBe(true);
+    expect(thumbnailSwitch().disabled).toBe(false);
+    expect(screen.getByRole('alert').textContent).toContain(
+      'Could not update File Explorer thumbnails',
+    );
+  });
 });
 
 describe('Settings > Behavior > Device > Gamepad Support', () => {
@@ -150,5 +247,36 @@ describe('Settings > Behavior > Device > Hide Bookshelf Buttons', () => {
     render(<ControlPanel bookKey='test' onRegisterReset={() => {}} />);
 
     expect(hideButtonsSwitch()?.disabled).toBe(true);
+  });
+});
+
+describe('Settings > Behavior > Device > Orientation', () => {
+  it('is hidden where the app cannot lock the orientation', () => {
+    render(<ControlPanel bookKey='test' onRegisterReset={() => {}} />);
+
+    expect(screen.queryByText('Orientation')).toBeNull();
+  });
+
+  it('sits in the Device section and locks the chosen orientation', () => {
+    platform.isMobileApp = true;
+    platform.hasOrientationLock = true;
+    render(<ControlPanel bookKey='test' onRegisterReset={() => {}} />);
+
+    const device = document.querySelector<HTMLElement>(
+      '[data-setting-id="settings.control.device"]',
+    )!;
+    expect(within(device).queryByText('Orientation')).not.toBeNull();
+
+    fireEvent.click(device.querySelector('[data-tip="Landscape"] button')!);
+
+    expect(saveViewSettings).toHaveBeenLastCalledWith(
+      {},
+      'test',
+      'screenOrientation',
+      'landscape',
+      false,
+      false,
+    );
+    expect(lockScreenOrientation).toHaveBeenLastCalledWith({ orientation: 'landscape' });
   });
 });

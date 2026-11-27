@@ -1,3 +1,4 @@
+// @vitest-environment happy-dom
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
 vi.mock('@/utils/misc', async (importOriginal) => ({
@@ -36,6 +37,18 @@ describe('unblockAudio', () => {
     // Desktop Tauri drives the OS media controls natively; a playing element
     // would register the webview's own competing session (WebView2 SMTC).
     vi.mocked(getOSPlatform).mockReturnValue('windows');
+    vi.mocked(isTauriAppPlatform).mockReturnValue(true);
+    const spy = vi.spyOn(document, 'createElement');
+    unblockAudio();
+    expect(spy).not.toHaveBeenCalledWith('audio');
+    spy.mockRestore();
+  });
+
+  test('does not create the keep-alive element on Android Tauri', () => {
+    // A playing element makes the WebView request transient audio focus,
+    // which takes it from the native media service. A navigation prompt then
+    // only ducks the WebView, and Read Aloud talks over it (#7819).
+    vi.mocked(getOSPlatform).mockReturnValue('android');
     vi.mocked(isTauriAppPlatform).mockReturnValue(true);
     const spy = vi.spyOn(document, 'createElement');
     unblockAudio();

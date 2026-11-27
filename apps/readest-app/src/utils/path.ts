@@ -1,14 +1,25 @@
 import { join } from '@tauri-apps/api/path';
-import { isContentURI, isFileURI, isValidURL } from './misc';
 
 export const getFilename = (fileOrUri: string) => {
-  if (isValidURL(fileOrUri) || isContentURI(fileOrUri) || isFileURI(fileOrUri)) {
-    fileOrUri = decodeURI(fileOrUri);
+  const isUri = /^(?:https?|content|file):\/\//i.test(fileOrUri);
+  const path = isUri ? decodeURI(fileOrUri.split('?', 1)[0]!) : fileOrUri;
+  return path.replace(/\\/g, '/').split('/').pop()!;
+};
+
+export const getPathFilename = (path: string) => {
+  // Backslashes are separators in drive-rooted and UNC Windows paths only.
+  const normalized = /^(?:[a-z]:[\\/]|\\\\)/i.test(path) ? path.replace(/\\/g, '/') : path;
+  return normalized.split('/').pop()!;
+};
+
+export const getURLFilename = (url: string) => {
+  const name = new URL(url).pathname.split('/').pop() || 'remote-file';
+  try {
+    return decodeURIComponent(name);
+  } catch {
+    // Keep the encoded basename when the server uses non-UTF-8 path bytes.
+    return name;
   }
-  const normalizedPath = fileOrUri.replace(/\\/g, '/');
-  const parts = normalizedPath.split('/');
-  const lastPart = parts.pop()!;
-  return lastPart.split('?')[0]!;
 };
 
 /**

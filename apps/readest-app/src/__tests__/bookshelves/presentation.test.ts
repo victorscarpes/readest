@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import type { Book } from '@/types/book';
 import { createBookshelf, defaultBookshelves } from '@/services/bookshelves/definitions';
@@ -13,6 +14,103 @@ const books: Book[] = Array.from({ length: 30 }, (_, index) => ({
   updatedAt: index,
 }));
 describe('bookshelf presentation parity', () => {
+  it.each([
+    false,
+    true,
+  ])('falls back to recent reading for a manual order without a metadata sort (recursive %s)', (recursive) => {
+    const definition = {
+      ...createBookshelf('', 'default'),
+      sort: {
+        by: 'custom' as const,
+        ascending: true,
+        thenBy: 'none' as const,
+        thenAscending: true,
+      },
+      ...(recursive && {
+        customSortFallback: {
+          by: 'custom' as const,
+          ascending: true,
+          thenBy: 'none' as const,
+          thenAscending: true,
+        },
+      }),
+      manualOrder: { 'none:': ['b:0'] },
+    };
+    const input = books.slice(0, 3).map((book) => ({ ...book, groupName: undefined }));
+    expect(
+      presentBookshelf(
+        { definition, books: input, matching: 3, excluded: 0 },
+        { libraryGroupBy: 'none' },
+        'en',
+      ).map((item) => ('hash' in item ? item.hash : item.id)),
+    ).toEqual(['0', '2', '1']);
+  });
+
+  it.each([
+    true,
+    false,
+  ])('naturally interleaves numbered groups and titles (ascending: %s)', (ascending) => {
+    const numberedBooks: Book[] = [12, 1, 22, 3].map((index) => ({
+      ...books[0]!,
+      hash: `${index}`,
+      title: `Volume ${index}`,
+      groupName: index === 3 || index === 12 ? `Volume ${index}` : undefined,
+    }));
+    const expected = ['Volume 1', 'Volume 3', 'Volume 12', 'Volume 22'];
+    for (const layout of ['grid', 'list', 'carousel'] as const) {
+      const definition = {
+        ...createBookshelf('', 'default'),
+        layout,
+        sort: { by: 'title' as const, ascending, thenBy: 'none' as const, thenAscending: true },
+      };
+      const result = evaluateBookshelves(numberedBooks, [definition], 'en')[0]!;
+      const presented = presentBookshelf(result, { libraryGroupBy: 'group' }, 'en');
+
+      expect(presented.map((item) => ('books' in item ? item.name : item.title))).toEqual(
+        ascending ? expected : [...expected].reverse(),
+      );
+    }
+  });
+
+  it.each([
+    true,
+    false,
+  ])('sorts subgroups by their own name among the books of a parent group (ascending: %s)', (ascending) => {
+    const languageBooks: Book[] = (
+      [
+        ['Writing Systems', 'Languages'],
+        ['Introduction to Linguistics', 'Languages'],
+        ['Etymology', 'Languages'],
+        ['Mandarin Basics', 'Languages/Chinese'],
+        ['French Grammar', 'Languages/French'],
+      ] as const
+    ).map(([title, groupName], index) => ({ ...books[0]!, hash: `${index}`, title, groupName }));
+    const expected = [
+      'Chinese',
+      'Etymology',
+      'French',
+      'Introduction to Linguistics',
+      'Writing Systems',
+    ];
+    const definition = {
+      ...createBookshelf('', 'default'),
+      sort: { by: 'title' as const, ascending, thenBy: 'none' as const, thenAscending: true },
+    };
+    const result = evaluateBookshelves(languageBooks, [definition], 'en')[0]!;
+    const presented = presentBookshelf(
+      result,
+      { libraryGroupBy: 'group' },
+      'en',
+      undefined,
+      'languages',
+      'Languages',
+    );
+
+    expect(presented.map((item) => ('books' in item ? item.displayName : item.title))).toEqual(
+      ascending ? expected : [...expected].reverse(),
+    );
+  });
+
   it('applies global grouping to every shelf and layout while retaining all books', () => {
     for (const layout of ['grid', 'list', 'carousel'] as const) {
       const definition = { ...createBookshelf('', 'default'), layout };

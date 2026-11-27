@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 // #6224: replaying an OPDS audiobook must work more than once. The session
@@ -10,6 +11,7 @@ const h = vi.hoisted(() => ({
   startAt: -1,
   durations: null as number[] | null,
   library: [] as Array<Record<string, unknown>>,
+  clockOptions: undefined as unknown,
 }));
 
 vi.mock('@/services/tts/TTSSessionManager', () => ({
@@ -24,6 +26,7 @@ vi.mock('@/services/opds/audioStream', () => ({
     authHeader: null,
     customHeaders: {},
     hasCredentials: false,
+    allowSelfSignedCert: false,
   }),
   canStreamOpdsAudio: () => true,
   buildOpdsAudioUrl: (href: string) => href,
@@ -33,7 +36,13 @@ vi.mock('@/services/opds/audioStream', () => ({
   probeAudioDurations: async (urls: string[]) => urls.map((_, i) => h.durations?.[i] ?? 20),
 }));
 
-vi.mock('@/services/audiobook/AudiobookClock', () => ({ HtmlAudioClock: class {} }));
+vi.mock('@/services/audiobook/AudiobookClock', () => ({
+  HtmlAudioClock: class {
+    constructor(options?: unknown) {
+      h.clockOptions = options;
+    }
+  },
+}));
 vi.mock('@/services/audiobook/AudiobookController', () => ({
   AudiobookController: class {
     kind = 'audiobook';
@@ -106,6 +115,14 @@ describe('openOpdsAudiobookSession session reuse', () => {
     expect(res).not.toBeNull();
     expect(res?.bookKey).not.toBe('dead-key');
     expect(h.claimed).toHaveLength(1);
+  });
+
+  // A catalog that plays on the web app today does so through a
+  // Cross-Origin-Resource-Policy header, which a CORS request would not satisfy.
+  it('keeps catalog tracks out of CORS mode', async () => {
+    await openOpdsAudiobookSession({ appService, book });
+
+    expect(h.clockOptions).toEqual({ cors: false });
   });
 });
 

@@ -1,3 +1,4 @@
+// @vitest-environment happy-dom
 import { describe, test, expect, beforeEach, vi } from 'vitest';
 
 // ── Mocks for constants ──────────────────────────────────────────
@@ -228,6 +229,17 @@ describe('environment', () => {
       delete env['NEXT_PUBLIC_API_BASE_URL'];
       const { getAPIBaseUrl } = await import('@/services/environment');
       expect(getAPIBaseUrl()).toBe('https://web.readest.com/api');
+    });
+  });
+
+  // ── getReadestVoiceAPIBaseUrl ──────────────────────────────────
+  describe('getReadestVoiceAPIBaseUrl', () => {
+    test('uses the production Web API even in web development mode', async () => {
+      env['NODE_ENV'] = 'development';
+      env['NEXT_PUBLIC_APP_PLATFORM'] = 'web';
+      delete env['NEXT_PUBLIC_API_BASE_URL'];
+      const { getReadestVoiceAPIBaseUrl } = await import('@/services/environment');
+      expect(getReadestVoiceAPIBaseUrl()).toBe('https://web.readest.com/api');
     });
   });
 

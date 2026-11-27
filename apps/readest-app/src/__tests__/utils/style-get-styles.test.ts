@@ -8,7 +8,13 @@ vi.mock('@/utils/misc', async (importOriginal) => {
   };
 });
 
-import { getStyles, LINK_TOUCH_HOLD_CLASS, TEXT_SELECTED_CLASS, ThemeCode } from '@/utils/style';
+import {
+  LINK_HIT_AREA_CLASS,
+  getStyles,
+  LINK_TOUCH_HOLD_CLASS,
+  TEXT_SELECTED_CLASS,
+  ThemeCode,
+} from '@/utils/style';
 import { CustomFont } from '@/styles/fonts';
 import { ViewSettings } from '@/types/book';
 import {
@@ -473,6 +479,42 @@ describe('getLayoutStyles branches (via getStyles)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// CJK widow/orphan lift under Use Book Layout
+// ---------------------------------------------------------------------------
+// The paragraph chunk lifts widows/orphans to 1 for CJK via `:lang(zh)…`, but
+// Use Book Layout skips that chunk wholesale and takes the lift with it — a
+// CJK book mislabeled `en` (#6672) then falls back to the UA default of 2 and
+// the page-bottom gap returns. A zero-specificity root fallback ships in
+// every mode: inert where the chunk is present, and scoped to `html:lang()`
+// so book-declared values on html/body reach the paragraphs by inheritance
+// instead of being stomped by a direct declaration (which beats any inherited
+// value regardless of specificity).
+describe('CJK widow/orphan lift (via getStyles)', () => {
+  const theme = makeThemeCode();
+  const whereRule = (css: string) =>
+    css.match(/:where\(html:lang\(zh\), html:lang\(ja\), html:lang\(ko\)\)\s*\{([^}]*)\}/)?.[1] ??
+    '';
+
+  it('ships the zero-specificity fallback even when Use Book Layout skips the paragraph chunk', () => {
+    const css = getStyles(makeViewSettings({ useBookLayout: true }), theme);
+    // the chunk's own class-strength lift is gone…
+    expect(css).not.toMatch(/(^|\n)\s*:lang\(zh\), :lang\(ja\), :lang\(ko\)\s*\{/);
+    // …but the fallback itself survives at zero specificity, on the roots only
+    const rule = whereRule(css);
+    expect(rule).toContain('widows: 1');
+    expect(rule).toContain('orphans: 1');
+  });
+
+  it('keeps the chunk lift and the zero-specificity fallback when Use Book Layout is off', () => {
+    const css = getStyles(makeViewSettings({ useBookLayout: false }), theme);
+    expect(css).toMatch(/(^|\n)\s*:lang\(zh\), :lang\(ja\), :lang\(ko\)\s*\{/);
+    const rule = whereRule(css);
+    expect(rule).toContain('widows: 1');
+    expect(rule).toContain('orphans: 1');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // getColorStyles branches
 // ---------------------------------------------------------------------------
 describe('getColorStyles branches (via getStyles)', () => {
@@ -506,6 +548,21 @@ describe('getColorStyles branches (via getStyles)', () => {
     expect(css).toContain('background-color: #fff !important');
     expect(css).toContain('color: #000 !important');
     expect(css).toContain('border-color: #000 !important');
+  });
+
+  // #7415: the resolved table colors are asserted in
+  // override-color-tables.browser.test.ts; this only pins the rule's gating.
+  const tableRule = (css: string) =>
+    css.match(/table, colgroup, col, thead, tbody, tfoot, tr, th, td, caption \{([^}]*)\}/)?.[1] ??
+    '';
+
+  it('overrides table backgrounds only when overrideColor is on (#7415)', () => {
+    const theme = makeThemeCode({ bg: '#fff', fg: '#000' });
+    const on = tableRule(getStyles(makeViewSettings({ overrideColor: true }), theme));
+    expect(on).toContain('background-color: #fff !important');
+    expect(on).toContain('background-image: none !important');
+    const off = tableRule(getStyles(makeViewSettings({ overrideColor: false }), theme));
+    expect(off).not.toContain('!important');
   });
 
   it('does not force color overrides when overrideColor is false', () => {
@@ -790,6 +847,17 @@ describe('getColorStyles branches (via getStyles)', () => {
     );
   });
 
+  it('keeps overriding text colors over a background texture, with transparent fills (#6712)', () => {
+    const vs = makeViewSettings({ overrideColor: true, backgroundTextureId: 'leaves' });
+    const theme = makeThemeCode({ isDarkMode: true, bg: '#1a1a1a', fg: '#e0e0e0' });
+    const css = getStyles(vs, theme);
+    const block = css.match(/section, aside, blockquote[^{]*\{([^}]*)\}/)![1]!;
+    expect(block).toContain('background-color: transparent !important');
+    expect(block).toContain('color: #e0e0e0 !important');
+    expect(block).toContain('border-color: #e0e0e0 !important');
+    expect(css).toMatch(/pre, span \{[^}]*background-color: transparent !important/);
+  });
+
   it('makes svg/img backgrounds transparent when overrideColor is true', () => {
     const vs = makeViewSettings({ overrideColor: true });
     const theme = makeThemeCode();
@@ -797,10 +865,19 @@ describe('getColorStyles branches (via getStyles)', () => {
     expect(css).toMatch(/svg,\s*img\s*\{[^}]*background-color:\s*transparent\s*!important/);
   });
 
-  it('applies screen blend mode for inline images in dark mode', () => {
+  it('draws inline images as ink in the text color in dark mode (#7981)', () => {
     const vs = makeViewSettings();
     const theme = makeThemeCode({ isDarkMode: true, bg: '#1a1a1a', fg: '#e0e0e0' });
     const css = getStyles(vs, theme);
+    expect(css).toContain('filter: url(#readest-dark-monochrome-e0e0e0);');
+    expect(css).toContain('mix-blend-mode: normal');
+  });
+
+  it('keeps screen blending for inline images when inverting images in dark mode', () => {
+    const vs = makeViewSettings({ invertImgColorInDark: true });
+    const theme = makeThemeCode({ isDarkMode: true, bg: '#1a1a1a', fg: '#e0e0e0' });
+    const css = getStyles(vs, theme);
+    expect(css).not.toContain('readest-dark-monochrome');
     expect(css).toContain('mix-blend-mode: screen');
   });
 
@@ -902,7 +979,14 @@ describe('translated text style (via getStyles)', () => {
 // ---------------------------------------------------------------------------
 describe('getRubyStyles branches (via getStyles)', () => {
   const theme = makeThemeCode();
+  const rubyBlock = (css: string) => css.match(/ruby\.wl-gloss\s*\{([^}]*)\}/)?.[1] ?? '';
   const rtBlock = (css: string) => css.match(/ruby\.wl-gloss\s*>\s*rt\s*\{([^}]*)\}/)?.[1] ?? '';
+
+  it('keeps glossed words unbroken and centered under their hint (#7880)', () => {
+    const block = rubyBlock(getStyles(makeViewSettings(), theme));
+    expect(block).toMatch(/white-space:\s*nowrap/);
+    expect(block).toMatch(/ruby-align:\s*center/);
+  });
 
   it('defaults the gloss to 0.5em and muted (opacity 0.7, no color override)', () => {
     const block = rtBlock(getStyles(makeViewSettings(), theme));
@@ -1058,6 +1142,38 @@ describe('instant-highlight selection suppression stays out of getStyles', () =>
 });
 
 describe('link touch hold (#6242)', () => {
+  it('keeps linked images hit-testable while text links stay suppressed', () => {
+    const iframe = document.createElement('iframe');
+    document.body.append(iframe);
+    try {
+      const doc = iframe.contentDocument!;
+      const style = doc.createElement('style');
+      style.textContent = getStyles(makeViewSettings(), makeThemeCode());
+      doc.head.append(style);
+      doc.body.innerHTML = `
+        <a href="#figure"><img id="figure" src="figure.png"></a>
+        <a href="#svg"><svg><image id="svg" href="figure.png"/></svg></a>
+        <a href="#note" id="text">note</a>
+        <a href="#glyph"><img id="glyph" zy-enlarge-src="none" style="pointer-events:none"></a>
+        <a href="#svg-glyph"><svg zy-enlarge-src="none"><image id="svg-glyph" href="figure.png"/></svg></a>
+      `;
+      doc.documentElement.classList.add(LINK_TOUCH_HOLD_CLASS);
+      const pointerEvents = (id: string) =>
+        doc.defaultView!.getComputedStyle(doc.getElementById(id)!).pointerEvents;
+      expect(pointerEvents('figure'), 'linked HTML image receives the hold').toBe('auto');
+      expect(pointerEvents('svg'), 'linked SVG image receives the hold').toBe('auto');
+      expect(pointerEvents('text'), 'text links stay out of hit testing').toBe('none');
+      expect(pointerEvents('glyph'), 'non-enlargeable glyph stays out of hit testing').toBe('none');
+      expect(pointerEvents('svg-glyph'), 'non-enlargeable SVG stays out of hit testing').toBe(
+        'none',
+      );
+      doc.documentElement.classList.remove(LINK_TOUCH_HOLD_CLASS);
+      expect(pointerEvents('text'), 'text link is clickable after release').toBe('auto');
+    } finally {
+      iframe.remove();
+    }
+  });
+
   it('takes links out of hit testing while a touch is held', () => {
     // Chromium's touch adjustment snaps a long press onto a link within reach
     // of the finger, and a long press on a link never starts a text selection.
@@ -1081,18 +1197,16 @@ describe('link hit area during a text selection (#6566)', () => {
   });
 });
 
-describe('paragraph indent exemption for image-only paragraphs', () => {
-  // A full-width inline image that takes the paragraph indent overhangs the
-  // column by the indent and paints a strip on the next page (#6198). The
-  // exemption must also see an image wrapped in a link, which is how Wikipedia
-  // (and most sites) mark up a figure: <p><span><a><img></a></span></p>.
-  it('drops the indent for an image wrapped in a link, with or without a span', () => {
-    const css = getStyles(makeViewSettings({ textIndent: 2 }));
-    const rule = css
-      .split('}')
-      .find((block) => block.includes('text-indent: initial !important') && block.includes('img'));
-    expect(rule).toBeDefined();
-    expect(rule).toContain('p:has(> a:only-child > img:only-child)');
-    expect(rule).toContain('p:has(> span:only-child > a:only-child > img:only-child)');
+describe('link hit area in link-dense sections', () => {
+  it('enlarges link hit areas only in documents opted in with LINK_HIT_AREA_CLASS', () => {
+    // Positioning every link and its ::before box made a 20 MB concordance
+    // section with 273k links take minutes to lay out, so the enlarged area is
+    // opt-in per document instead of on by default.
+    const css = getStyles(makeViewSettings(), makeThemeCode());
+    expect(css).toMatch(
+      new RegExp(`html\\.${LINK_HIT_AREA_CLASS} a\\s*\\{\\s*position: relative !important;`),
+    );
+    expect(css).toMatch(new RegExp(`html\\.${LINK_HIT_AREA_CLASS} a::before\\s*\\{`));
+    expect(css).not.toMatch(/(^|\n)\s*a\s*\{\s*position: relative !important;/);
   });
 });

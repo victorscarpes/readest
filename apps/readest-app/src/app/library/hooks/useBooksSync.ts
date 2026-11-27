@@ -33,7 +33,7 @@ export const useBooksSync = () => {
   const { user } = useAuth();
   const { envConfig, appService } = useEnv();
   const { library, isSyncing, libraryLoaded } = useLibraryStore();
-  const { setLibrary, setIsSyncing, setSyncProgress } = useLibraryStore();
+  const { setLibrary, setIsSyncing, setIsPullingLibrary, setSyncProgress } = useLibraryStore();
   const { useSyncInited, syncedBooks, syncBooks, lastSyncedAtBooks } = useSync();
   const isPullingRef = useRef(false);
   // A library change that lands while a sync is in flight must not be lost.
@@ -128,7 +128,15 @@ export const useBooksSync = () => {
         if (runNativePull) {
           const library = useLibraryStore.getState().library;
           const since = (libraryLoaded && library.length === 0) || fullRefresh ? 0 : undefined;
-          nativeSynced = (await syncBooks([], 'pull', since)) ?? 0;
+          // The shelf shows nothing (deleted books stay in the library as tombstones). Not
+          // isSyncing: books arriving while it is set wait 10 s to be added.
+          const emptyShelf = libraryLoaded && library.every((book) => book.deletedAt);
+          if (emptyShelf) setIsPullingLibrary(true);
+          try {
+            nativeSynced = (await syncBooks([], 'pull', since)) ?? 0;
+          } finally {
+            if (emptyShelf) setIsPullingLibrary(false);
+          }
         }
 
         if (verbose) {
@@ -148,7 +156,7 @@ export const useBooksSync = () => {
         releaseSyncLock();
       }
     },
-    [_, user, libraryLoaded, syncBooks, envConfig, releaseSyncLock],
+    [_, user, libraryLoaded, syncBooks, envConfig, releaseSyncLock, setIsPullingLibrary],
   );
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -207,10 +215,10 @@ export const useBooksSync = () => {
     if (!syncedBooks?.length) return;
 
     // A cloud row for a demo book can only be a stale one pushed before #5049.
-    // Merging it back would write over the local demo row — and, because a
-    // delete doesn't bump `updatedAt`, the not-deleted cloud row wins the LWW
-    // tie and clears `deletedAt`, resurrecting a book the user just deleted
-    // (coverless, since its cover was never uploaded either).
+    // Merging it back would write over the local demo row — and, for a demo
+    // book deleted before deletes stamped `updatedAt` (#6663), the not-deleted
+    // cloud row wins the LWW tie and clears `deletedAt`, resurrecting a book
+    // the user deleted (coverless, since its cover was never uploaded either).
     const demoHashes = new Set(
       useLibraryStore
         .getState()

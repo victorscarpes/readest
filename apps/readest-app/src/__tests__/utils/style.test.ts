@@ -1,3 +1,4 @@
+// @vitest-environment happy-dom
 import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('@/utils/misc', async (importOriginal) => {
@@ -8,7 +9,12 @@ vi.mock('@/utils/misc', async (importOriginal) => {
   };
 });
 
-import { transformStylesheet, getFootnoteStyles } from '@/utils/style';
+import {
+  applyViewportUnits,
+  transformStylesheet,
+  transformInlineFonts,
+  getFootnoteStyles,
+} from '@/utils/style';
 
 describe('transformStylesheet', () => {
   const VW = 1000;
@@ -16,10 +22,10 @@ describe('transformStylesheet', () => {
   const VERTICAL = false;
 
   describe('text-align center + text-indent 0', () => {
-    it('adds !important to both text-align and text-indent when both present in same rule', () => {
+    it('adds !important only to text-indent when both present in same rule', () => {
       const css = '.centered { text-align: center; text-indent: 0; }';
       const result = transformStylesheet(css, VW, VH, VERTICAL);
-      expect(result).toContain('text-align: center !important');
+      expect(result).not.toContain('text-align: center !important');
       expect(result).toContain('text-indent: 0 !important');
     });
 
@@ -37,16 +43,51 @@ describe('transformStylesheet', () => {
   });
 
   describe('white-space nowrap', () => {
-    it('adds overflow clip !important when no overflow is set', () => {
+    // A nowrapped line must not spill past the column into the margin or the
+    // next page, so it is clipped along the line. Clipping the other axis too
+    // cut off whatever rises above or hangs below the line box, such as a
+    // top-aligned footnote icon in a <sup> on the first line (#6797).
+    it('clips a nowrapped element along the line only', () => {
       const css = '.nowrap { white-space: nowrap; }';
       const result = transformStylesheet(css, VW, VH, VERTICAL);
-      expect(result).toContain('overflow: clip !important');
+      expect(result).toContain('overflow-x: clip !important');
+      expect(result).not.toContain('overflow-y: clip');
+      expect(result).not.toMatch(/[^-]overflow: clip/);
     });
 
-    it('does not add overflow clip when overflow is already set', () => {
+    it('clips a nowrapped element vertically in vertical writing', () => {
+      const css = '.nowrap { white-space: nowrap; }';
+      const result = transformStylesheet(css, VW, VH, true);
+      expect(result).toContain('overflow-y: clip !important');
+      expect(result).not.toContain('overflow-x: clip');
+    });
+
+    // A nowrapped rule that sizes its own box (height, max-height, line clamp)
+    // may rely on the box clipping its content, so it keeps the old clip on
+    // both axes; only unsized nowrapped elements let content rise past the line.
+    it('keeps clipping both axes when the rule sets its own height', () => {
+      for (const sizing of ['height: 2em', 'max-height: 3em', '-webkit-line-clamp: 2']) {
+        const css = `.box { white-space: nowrap; ${sizing}; }`;
+        const result = transformStylesheet(css, VW, VH, VERTICAL);
+        expect(result).toContain('overflow: clip !important');
+        expect(result).not.toContain('overflow-x: clip');
+      }
+    });
+
+    it('treats line-height and min-height as unsized (the #6797 rule)', () => {
+      const css =
+        '.adapt-poem-c { text-indent: 0; text-align: center; font-size: 1.0em; ' +
+        'margin: 0.85em auto; word-break: break-all; white-space: nowrap; ' +
+        'letter-spacing: normal; line-height: 1.7; min-height: 1em; }';
+      const result = transformStylesheet(css, VW, VH, VERTICAL);
+      expect(result).toContain('overflow-x: clip !important');
+      expect(result).not.toMatch(/[^-]overflow: clip/);
+    });
+
+    it('does not add a clip when overflow is already set', () => {
       const css = '.nowrap { white-space: nowrap; overflow: hidden; }';
       const result = transformStylesheet(css, VW, VH, VERTICAL);
-      expect(result).not.toContain('overflow: clip !important');
+      expect(result).not.toContain('clip !important');
     });
   });
 
@@ -127,18 +168,99 @@ describe('transformStylesheet', () => {
   });
 
   describe('vw/vh replacement', () => {
-    it('replaces vw with computed px', () => {
+    it('resolves vw against the live reader width with an initial fallback', () => {
       const css = '.w { width: 10vw; }';
       const result = transformStylesheet(css, VW, VH, VERTICAL);
-      // 10 * 1000 / 100 = 100px
-      expect(result).toContain('100px');
+      expect(result).toContain('calc(10*var(--readest-vw,10px))');
     });
 
-    it('replaces vh with computed px', () => {
-      const css = '.h { height: 50vh; }';
+    it('keeps negative and fractional viewport lengths valid', () => {
+      const css =
+        '.h { margin-top: -0.5vh; font-size: 5vh; content: "50vh"; background-image: url(50vh.png); }';
       const result = transformStylesheet(css, VW, VH, VERTICAL);
-      // 50 * 800 / 100 = 400px
-      expect(result).toContain('400px');
+      expect(result).toContain('margin-top: calc(-0.5*var(--readest-vh,8px))');
+      expect(result).toContain('font-size: calc(5*var(--readest-vh,8px))');
+      expect(result).toContain('content: "50vh"');
+      expect(result).toContain('url(50vh.png)');
+    });
+
+    it('keeps media query lengths independent of CSS variables', () => {
+      const result = transformStylesheet(
+        '@media (max-width: 50vw) { p { width: 20vw; } }',
+        VW,
+        VH,
+        VERTICAL,
+      );
+      expect(result).toContain('@media (max-width: 500px)');
+      expect(result).toContain('width: calc(20*var(--readest-vw,10px))');
+    });
+
+    it('resolves container query lengths against the reader, not the iframe', () => {
+      const result = transformStylesheet(
+        '@container (min-width: 40vw) { p { width: 1vw; } }',
+        VW,
+        VH,
+        VERTICAL,
+      );
+      expect(result).toContain('@container (min-width: 400px)');
+    });
+
+    it('rewrites every length in a value list and leaves identifiers alone', () => {
+      const result = transformStylesheet(
+        '.a-10vw, .x10vh { margin: 1vw 2.5vh,3vw; }',
+        VW,
+        VH,
+        VERTICAL,
+      );
+      expect(result).toBe(
+        '.a-10vw, .x10vh { margin: calc(1*var(--readest-vw,10px)) ' +
+          'calc(2.5*var(--readest-vh,8px)),calc(3*var(--readest-vw,10px)); }',
+      );
+    });
+
+    it('rewrites a length right after a comment and keeps an explicit plus sign', () => {
+      const result = transformStylesheet(
+        'p { width:/*note*/20vw; margin-left: +10vw; }',
+        VW,
+        VH,
+        VERTICAL,
+      );
+      expect(result).toBe(
+        'p { width:/*note*/calc(20*var(--readest-vw,10px)); ' +
+          'margin-left: calc(+10*var(--readest-vw,10px)); }',
+      );
+    });
+
+    it('reads exponent notation as one length', () => {
+      const result = transformStylesheet('p { width: 1e1vw; height: 2E-1vh; }', VW, VH, VERTICAL);
+      expect(result).toBe(
+        'p { width: calc(1e1*var(--readest-vw,10px)); height: calc(2E-1*var(--readest-vh,8px)); }',
+      );
+    });
+
+    it('resolves @import media conditions to px', () => {
+      const result = transformStylesheet(
+        '@import url(extra.css) screen and (max-width: 50vw);\np { width: 1vw; }',
+        VW,
+        VH,
+        VERTICAL,
+      );
+      expect(result).toContain('@import url(extra.css) screen and (max-width: 500px);');
+    });
+
+    it('keeps the reader font fallback on a viewport-sized font shorthand', () => {
+      const result = transformStylesheet('p { font: 5vh/1.2 serif; }', VW, VH, VERTICAL);
+      expect(result).toContain('var(--book-serif, serif)');
+    });
+
+    it('mirrors the reading area onto a section and skips one without a root', () => {
+      const doc = document.implementation.createHTMLDocument();
+      applyViewportUnits(doc, 600, 900);
+      expect(doc.documentElement.style.getPropertyValue('--readest-vw')).toBe('6px');
+      expect(doc.documentElement.style.getPropertyValue('--readest-vh')).toBe('9px');
+      // A section document can briefly have no root while the reader remounts.
+      const rootless = document.implementation.createDocument(null, null);
+      expect(() => applyViewportUnits(rootless, 600, 900)).not.toThrow();
     });
   });
 
@@ -160,6 +282,69 @@ describe('transformStylesheet', () => {
       const css = '.sel { user-select: none; }';
       const result = transformStylesheet(css, VW, VH, VERTICAL);
       expect(result).toContain('user-select: unset');
+    });
+  });
+
+  describe('font shorthand publisher fonts (#7276)', () => {
+    it('wraps the family list after the size and line-height', () => {
+      expect(
+        transformInlineFonts('font: italic bold 1.2em / 1.5 "Futura", sans-serif !important'),
+      ).toBe(
+        'font: italic bold 1.2em / 1.5 var(--book-sans-serif, "Futura", sans-serif) !important',
+      );
+      expect(
+        transformStylesheet('p { font: small-caps 700 12px Palatino, serif; }', VW, VH, VERTICAL),
+      ).toContain('font: small-caps 700 12px var(--book-serif, Palatino, serif);');
+    });
+
+    it('leaves a shorthand without a size or a generic alone', () => {
+      expect(transformInlineFonts('font: caption')).toBe('font: caption');
+      expect(transformInlineFonts('font: 1em Papyrus, fantasy')).toBe('font: 1em Papyrus, fantasy');
+    });
+
+    // A quadratic match took over 2 s on 20,000 spaces after `font:`.
+    it('stays linear on long runs of whitespace', () => {
+      const css = `p { font:${' '.repeat(50_000)}}`;
+      const start = performance.now();
+      transformInlineFonts(css);
+      expect(performance.now() - start).toBeLessThan(200);
+    });
+  });
+
+  describe('publisher font list parsing (#7276)', () => {
+    it.each([
+      '"Decorative, serif, ornaments", fantasy',
+      '"A /* serif, */ B", fantasy',
+      String.raw`"A \"quoted, serif\" name", fantasy`,
+      String.raw`Publisher\,serif, fantasy`,
+      'var(--publisher, serif), fantasy',
+    ])('preserves quoted, escaped and functional names: %s', (families) => {
+      const css = `p { font-family: ${families}; }`;
+      expect(transformStylesheet(css, VW, VH, VERTICAL)).toBe(css);
+      expect(transformInlineFonts(`font-family: ${families}`)).toBe(`font-family: ${families}`);
+      expect(transformInlineFonts(`font: 16px ${families}`)).toBe(`font: 16px ${families}`);
+    });
+
+    it('recognizes generics surrounded by comments without altering quoted comment text', () => {
+      const families = '"A /* serif, */ B", /* fallback */ serif /* end */';
+      expect(transformStylesheet(`p { font-family: ${families}; }`, VW, VH, VERTICAL)).toContain(
+        'var(--book-serif, "A /* serif, */ B", /* fallback */ var(--serif, serif) /* end */)',
+      );
+      for (const prefix of ['font-family:', 'font: 16px']) {
+        expect(transformInlineFonts(`${prefix} ${families}`)).toBe(
+          `${prefix} var(--book-serif, ${families})`,
+        );
+      }
+    });
+
+    it('nests every eligible category in list order', () => {
+      const families = 'Publisher, serif, monospace';
+      expect(transformInlineFonts(`font-family: ${families}`)).toBe(
+        `font-family: var(--book-serif, var(--book-monospace, ${families}))`,
+      );
+      expect(transformInlineFonts(`font: 16px ${families}`)).toBe(
+        `font: 16px var(--book-serif, var(--book-monospace, ${families}))`,
+      );
     });
   });
 
@@ -185,14 +370,14 @@ describe('transformStylesheet', () => {
     it('keeps a trailing !important on the declaration', () => {
       const css = '.text { font-family: serif !important; }';
       const result = transformStylesheet(css, VW, VH, VERTICAL);
-      expect(result).toContain('font-family: var(--serif, serif) !important');
+      expect(result).toContain('font-family: var(--book-serif, var(--serif, serif)) !important');
     });
 
     it('replaces every generic in a list, not just the first', () => {
       const css = '.text { font-family: Helvetica, sans-serif, monospace; }';
       const result = transformStylesheet(css, VW, VH, VERTICAL);
       expect(result).toContain(
-        'font-family: Helvetica, var(--sans-serif, sans-serif), var(--monospace, monospace)',
+        'font-family: var(--book-sans-serif, var(--book-monospace, Helvetica, var(--sans-serif, sans-serif), var(--monospace, monospace)))',
       );
     });
 
@@ -209,13 +394,17 @@ describe('transformStylesheet', () => {
         'body { font-family: Source Han Serif CN, serif; }';
       const result = transformStylesheet(css, VW, VH, VERTICAL);
       expect(result).toContain('@font-face { font-family: Source Han Serif CN;');
-      expect(result).toContain('font-family: Source Han Serif CN, var(--serif, serif)');
+      expect(result).toContain(
+        'font-family: var(--book-serif, Source Han Serif CN, var(--serif, serif))',
+      );
     });
 
     it('leaves a quoted font name containing "Serif" untouched', () => {
       const css = 'p { font-family: "Comic Serif Face", serif; }';
       const result = transformStylesheet(css, VW, VH, VERTICAL);
-      expect(result).toContain('font-family: "Comic Serif Face", var(--serif, serif)');
+      expect(result).toContain(
+        'font-family: var(--book-serif, "Comic Serif Face", var(--serif, serif))',
+      );
     });
 
     it('leaves font names containing sans-serif/monospace words untouched', () => {
@@ -283,6 +472,22 @@ describe('transformStylesheet', () => {
       const css = '.text { color: rgb(0, 0, 0); }';
       const result = transformStylesheet(css, VW, VH, VERTICAL);
       expect(result).toContain('color: var(--theme-fg-color)');
+    });
+
+    it('replaces black written with an alpha digit', () => {
+      for (const black of ['#000f', '#000000ff']) {
+        const result = transformStylesheet(`.text { color: ${black}; }`, VW, VH, VERTICAL);
+        expect(result).toContain('color: var(--theme-fg-color);');
+      }
+    });
+
+    // `#000` matched the start of `#0000FF`, leaving `var(--theme-fg-color)0FF`,
+    // which is invalid when computed, so the link fell back to the text color (#6858)
+    it('keeps a color that only starts like black', () => {
+      for (const color of ['#0000FF', '#000080', '#0001', '#00000080']) {
+        const result = transformStylesheet(`a { color: ${color}; }`, VW, VH, VERTICAL);
+        expect(result).toContain(`color: ${color};`);
+      }
     });
   });
 
@@ -594,31 +799,19 @@ describe('transformStylesheet', () => {
   // The paginator sizes the section iframe to the whole multi-column strip, so
   // `(orientation: ...)` inside a section describes the strip, not a page — and
   // the strip is derived from the content, so the query and the page count feed
-  // each other and the layout never settles (#6038).
+  // each other and the layout never settles (#6038). The reading area can turn
+  // while the book is open, so applyOrientationMedia resolves the feature on the
+  // parsed sheet (style-orientation.browser.test.ts); the text pass leaves it.
   describe('orientation media queries', () => {
     const LANDSCAPE_CSS = '@media screen and (orientation: landscape) { div { column-count: 2; } }';
-    const PORTRAIT_CSS = '@media screen and (orientation:portrait) { div { column-count: 2; } }';
 
-    it('keeps a landscape block when the reader viewport is landscape', () => {
-      const result = transformStylesheet(LANDSCAPE_CSS, 1000, 800, VERTICAL);
-      expect(result).toContain('@media screen and (min-width: 0px)');
-      expect(result).not.toContain('orientation');
-    });
-
-    it('drops a landscape block when the reader viewport is portrait', () => {
-      const result = transformStylesheet(LANDSCAPE_CSS, 800, 1000, VERTICAL);
-      expect(result).toContain('@media screen and (min-width: 999999px)');
-      expect(result).not.toContain('orientation');
-    });
-
-    it('keeps a portrait block when the reader viewport is portrait', () => {
-      const result = transformStylesheet(PORTRAIT_CSS, 800, 1000, VERTICAL);
-      expect(result).toContain('@media screen and (min-width: 0px)');
-    });
-
-    it('drops a portrait block when the reader viewport is landscape', () => {
-      const result = transformStylesheet(PORTRAIT_CSS, 1000, 800, VERTICAL);
-      expect(result).toContain('@media screen and (min-width: 999999px)');
+    it('leaves the feature for the reader to resolve, whatever the open-book viewport', () => {
+      expect(transformStylesheet(LANDSCAPE_CSS, 1000, 800, VERTICAL)).toContain(
+        '@media screen and (orientation: landscape)',
+      );
+      expect(transformStylesheet(LANDSCAPE_CSS, 800, 1000, VERTICAL)).toContain(
+        '@media screen and (orientation: landscape)',
+      );
     });
 
     it('leaves the rest of the query and its declarations intact', () => {

@@ -1,3 +1,4 @@
+import type { InkTool } from '@/services/handwriting/model';
 import type { BookshelfState } from './bookshelf';
 import { CustomTheme } from '@/styles/themes';
 import { CustomFont } from '@/styles/fonts';
@@ -7,13 +8,17 @@ import { OPDSCatalog } from './opds';
 import { WebSource } from './webSource';
 import { ABSServer } from './audiobookshelf';
 import type { CustomTranslator, TranslationPrompt } from './translation';
+import type { CustomTTSService } from './customTTS';
 import type { AISettings } from '@/services/ai/types';
+import type { CoverSearchEngine } from '@/services/metadata/coverSearch';
 import type { NotebookTab } from '@/store/notebookStore';
 import type { DictionarySettings, ImportedDictionary } from '@/services/dictionaries/types';
+import type { AnkiProfileSettings } from '@/services/vocabulary/types';
 
 export type ThemeType = 'light' | 'dark' | 'auto';
 export type LibraryViewModeType = 'grid' | 'list';
 export const LibrarySortByType = {
+  Custom: 'custom',
   Title: 'title',
   Author: 'author',
   Updated: 'updated',
@@ -23,6 +28,7 @@ export const LibrarySortByType = {
   Format: 'format',
   Published: 'published',
   Progress: 'progress',
+  Pages: 'pages',
   TimeRemaining: 'timeRemaining',
 } as const;
 
@@ -36,6 +42,16 @@ export type LibrarySortByType = (typeof LibrarySortByType)[keyof typeof LibraryS
  * `resolveEffectiveSecondarySort`.
  */
 export type LibrarySecondarySortByType = LibrarySortByType | 'none';
+
+export type LibraryMetadataSortByType = Exclude<
+  LibrarySortByType,
+  typeof LibrarySortByType.Custom | typeof LibrarySortByType.Size
+>;
+
+export interface LibrarySortCriterion {
+  by: LibraryMetadataSortByType;
+  ascending: boolean;
+}
 
 export type LibraryCoverFitType = 'crop' | 'fit';
 
@@ -52,6 +68,7 @@ export const LibraryGroupByType = {
 export type LibraryGroupByType = (typeof LibraryGroupByType)[keyof typeof LibraryGroupByType];
 
 export type KOSyncChecksumMethod = 'binary' | 'filename';
+export type KOSyncFilenameFormat = 'original' | 'author-title' | 'title-author';
 export type KOSyncStrategy = 'prompt' | 'silent' | 'send' | 'receive';
 
 export interface ReadSettings {
@@ -76,6 +93,14 @@ export interface ReadSettings {
   defaultHighlightLabels: Partial<Record<HighlightColor, string>>;
   customTtsHighlightColors: string[];
   customThemes: CustomTheme[];
+
+  /** Ink color and pen width for the handwriting tool, remembered per install. */
+  handwritingColor: string;
+  handwritingWidth: number;
+  /** The drawing tool last used, and the marker's own color and width. */
+  handwritingTool: InkTool;
+  handwritingMarkerColor: string;
+  handwritingMarkerWidth: number;
 }
 
 export interface KOSyncSettings {
@@ -87,6 +112,11 @@ export interface KOSyncSettings {
   deviceId: string;
   deviceName: string;
   checksumMethod: KOSyncChecksumMethod;
+  /**
+   * The name the File Name checksum hashes for a book without a name of its
+   * own (`BookMetadata.kosyncFilename`). Unset means 'original'.
+   */
+  filenameFormat?: KOSyncFilenameFormat;
   strategy: KOSyncStrategy;
   customHeaders?: Record<string, string>;
   /**
@@ -97,6 +127,12 @@ export interface KOSyncSettings {
    * Off by default, matching KOReader.
    */
   sendMetadata?: boolean;
+  /**
+   * Accept a self-signed or mismatched TLS certificate from this server on
+   * native requests. Unset on settings saved before the option existed, which
+   * keep accepting them; see `allowsSelfSignedCert`.
+   */
+  allowSelfSignedCert?: boolean;
 }
 
 export interface BookOrbitSettings {
@@ -106,6 +142,12 @@ export interface BookOrbitSettings {
   username: string;
   userkey: string;
   password?: string;
+  /**
+   * BookOrbit 3.8+ API key for the audiobook API. When set, it is sent as the
+   * bearer instead of signing in with `password`; KOReader sync still uses
+   * `username` and `userkey`, which BookOrbit's KOReader routes require.
+   */
+  apiKey?: string;
   deviceId: string;
   deviceName: string;
   strategy: KOSyncStrategy;
@@ -124,6 +166,30 @@ export interface BookOrbitSettings {
    * option existed keep the automatic pushes they already had.
    */
   autoSync?: boolean;
+  /**
+   * Accept a self-signed or mismatched TLS certificate from this server on
+   * native requests. Unset on settings saved before the option existed, which
+   * keep accepting them; see `allowsSelfSignedCert`.
+   */
+  allowSelfSignedCert?: boolean;
+}
+
+export interface GrimmorySettings {
+  enabled: boolean;
+  /** Base server origin, e.g. https://books.example.com (no /api path). */
+  serverUrl: string;
+  username: string;
+  /** Kept to sign in again once the server's refresh token runs out. */
+  password: string;
+  strategy: KOSyncStrategy;
+  syncProgress: boolean;
+  /** Highlights, notes and bookmarks. */
+  syncNotes: boolean;
+  syncStats: boolean;
+  syncBookStates: boolean;
+  customHeaders?: Record<string, string>;
+  /** Unset means accepted, as for the other servers; see `allowsSelfSignedCert`. */
+  allowSelfSignedCert?: boolean;
 }
 
 export interface ReadwiseSettings {
@@ -181,6 +247,21 @@ export interface NotionSettings {
   lastSyncedAt: number;
   /** Append a chapter heading block before each highlight (default ON). */
   includeChapterHeading?: boolean;
+  /** Render each note through `customTemplate` instead of the built-in layout. */
+  useCustomTemplate?: boolean;
+  /** Nunjucks template rendering one note as Markdown, converted to Notion blocks. */
+  customTemplate?: string;
+}
+
+/**
+ * Writes each book's highlights into a Markdown note in an Obsidian vault
+ * folder (#7061). Per device: the folder is a local path, so this slice is
+ * not in the synced settings allowlist.
+ */
+export interface ObsidianSettings {
+  enabled: boolean;
+  /** Absolute path of the vault folder the book notes go into. */
+  folder: string;
 }
 
 /**
@@ -209,6 +290,7 @@ export interface WebDAVSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   // When true, "Sync now" re-checks every book instead of only those whose
   // local copy differs from the shared library.json index (the default
   // incremental walk). An escape hatch for drift or a first full sync.
@@ -243,6 +325,7 @@ export interface GoogleDriveSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   fullSync?: boolean;
   strategy?: KOSyncStrategy;
   deviceId?: string;
@@ -271,6 +354,7 @@ export interface S3Settings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   fullSync?: boolean;
   strategy?: KOSyncStrategy;
   deviceId?: string;
@@ -293,6 +377,7 @@ export interface OneDriveSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   fullSync?: boolean;
   strategy?: KOSyncStrategy;
   deviceId?: string;
@@ -312,6 +397,7 @@ export interface ICloudSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   fullSync?: boolean;
   strategy?: KOSyncStrategy;
   deviceId?: string;
@@ -350,7 +436,8 @@ export interface ReadestCloudSettings {
  * User-facing sync categories. 'progress' gates the existing book-config
  * (reading progress) sync, 'note' gates annotations, 'book' gates book
  * binaries + metadata, 'dictionary' gates the imported-dictionary replica
- * sync. 'credentials' is a meta-toggle that gates the encrypted-credential
+ * sync. 'book_data' gates a book's synced data files (downloaded read-aloud
+ * audio, later translations). 'credentials' is a meta-toggle that gates the encrypted-credential
  * fields (OPDS username/password, KOSync credentials, Readwise / Hardcover
  * tokens) across whichever replica kinds carry them. Adding a new replica
  * kind extends this union.
@@ -359,28 +446,34 @@ export type SyncCategory =
   | 'book'
   | 'progress'
   | 'note'
+  | 'book_data'
   | 'dictionary'
   | 'font'
   | 'texture'
   | 'opds_catalog'
   | 'abs_server'
   | 'custom_translator'
+  | 'custom_tts'
   | 'settings'
   | 'credentials'
-  | 'stats';
+  | 'stats'
+  | 'vocabulary';
 
 export const SYNC_CATEGORIES: readonly SyncCategory[] = [
   'book',
   'progress',
   'note',
+  'book_data',
   'dictionary',
   'font',
   'texture',
   'opds_catalog',
   'abs_server',
   'custom_translator',
+  'custom_tts',
   'settings',
   'stats',
+  'vocabulary',
   'credentials',
 ] as const;
 
@@ -481,6 +574,12 @@ export interface SystemSettings {
   bookshelves?: BookshelfState;
   libraryViewMode: LibraryViewModeType;
   librarySortBy: LibrarySortByType;
+  /**
+   * Custom order picked in the View menu. Kept out of `librarySortBy`, which
+   * stays a metadata sort: releases before custom order give every shelf with
+   * an unknown sort no books, so a downgrade would open on an empty library.
+   */
+  librarySortCustom?: boolean;
   librarySortAscending: boolean;
   /**
    * Whether the primary sort uses a smart default derived from `libraryGroupBy`.
@@ -493,7 +592,12 @@ export interface SystemSettings {
   libraryThenSortBy: LibrarySecondarySortByType;
   /** Sort order of the secondary ("Then by") key, independent of `librarySortAscending` (#5119). */
   libraryThenSortAscending: boolean;
+  /** Ordered list of unique metadata sort criteria (highest priority first) with per-criterion direction. */
+  librarySortOrder?: LibrarySortCriterion[];
   libraryGroupBy: LibraryGroupByType;
+  /** Whether the View menu's Group by... and Sort by... sections open expanded (#7893). */
+  libraryGroupByExpanded: boolean;
+  librarySortByExpanded: boolean;
   libraryCoverFit: LibraryCoverFitType;
   libraryAutoColumns: boolean;
   libraryColumns: number;
@@ -522,17 +626,24 @@ export interface SystemSettings {
   customTextures: CustomTexture[];
   customDictionaries: ImportedDictionary[];
   dictionarySettings: DictionarySettings;
+  /** The card profiles Sync with Anki uses (#7849); Readest's own cards without one. */
+  ankiProfiles?: AnkiProfileSettings;
   opdsCatalogs: OPDSCatalog[];
   absServers: ABSServer[];
   /** User-configured translation backends; synced as `custom_translator`. */
   customTranslators?: CustomTranslator[];
   /** User translation prompts; synced as `translation_prompt`. */
   translationPrompts?: TranslationPrompt[];
+  /** User OpenAI-compatible speech services; synced as `custom_tts`. */
+  customTTSServices?: CustomTTSService[];
   /** Saved sites for the "From Web Browser" import (#5775). Device-local. */
   webSources?: WebSource[];
+  /** Additional image-search engines for the cover editor. Device-local. */
+  coverSearchEngines?: CoverSearchEngine[];
   metadataSeriesCollapsed: boolean;
   metadataOthersCollapsed: boolean;
   metadataDescriptionCollapsed: boolean;
+  metadataStatsCollapsed: boolean;
   lastSyncedAtBooks: number;
   lastSyncedAtConfigs: number;
   lastSyncedAtNotes: number;
@@ -558,10 +669,12 @@ export interface SystemSettings {
 
   kosync: KOSyncSettings;
   bookorbit: BookOrbitSettings;
+  grimmory: GrimmorySettings;
   readwise: ReadwiseSettings;
   hardcover: HardcoverSettings;
   pagebound: PageboundSettings;
   notion: NotionSettings;
+  obsidian: ObsidianSettings;
   /** Optional by design — see {@link ReadestCloudSettings}. Never defaulted. */
   readestCloud?: ReadestCloudSettings;
   webdav: WebDAVSettings;
@@ -578,6 +691,12 @@ export interface SystemSettings {
    * distinct identifier semantics and rotation policies.
    */
   replicaDeviceId?: string;
+  /**
+   * iOS only: copy of the device-bound keychain anchor. When it differs from
+   * the keychain, settings.json came from another device and the sync device
+   * IDs above are replaced (#7558).
+   */
+  deviceAnchor?: string;
   /**
    * Per-kind cursor for replica sync. Stores the HLC string of the last
    * pulled row per kind. Absent kinds pull from the beginning.

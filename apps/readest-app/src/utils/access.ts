@@ -1,9 +1,14 @@
 import { jwtDecode } from 'jwt-decode';
 import { supabase } from '@/utils/supabase';
 import { UserPlan } from '@/types/quota';
-import { DEFAULT_DAILY_TRANSLATION_QUOTA, DEFAULT_STORAGE_QUOTA } from '@/services/constants';
+import {
+  DEFAULT_DAILY_TRANSLATION_QUOTA,
+  DEFAULT_DAILY_TTS_QUOTA,
+  DEFAULT_STORAGE_QUOTA,
+  FREE_PLAN_DEVICE_LIMIT,
+} from '@/services/constants';
 import { isWebAppPlatform } from '@/services/environment';
-import { getDailyUsage } from '@/services/translators/utils';
+import { getDailyUsage } from '@/services/translators/dailyUsage';
 import { getRuntimeConfig } from '@/services/runtimeConfig';
 
 interface Token {
@@ -119,6 +124,17 @@ export const isAbsOfflineAllowed = (plan: UserPlan, customizationPurchased: bool
   !ABS_OFFLINE_REQUIRES_PREMIUM || isAbsOfflineInPlan(plan, customizationPurchased);
 
 /**
+ * Master switch for the Anki paywall: sending words to AnkiDroid, importing a
+ * deck back, and the Anki file export are premium ({@link isCustomizationAllowed}).
+ * CSV export stays free. Client-side gate, like the TTS cache. Flipping it off
+ * ungates every plan.
+ */
+export const ANKI_REQUIRES_PREMIUM = true;
+
+export const isAnkiAllowed = (plan: UserPlan, customizationPurchased: boolean): boolean =>
+  !ANKI_REQUIRES_PREMIUM || isCustomizationAllowed(plan, customizationPurchased);
+
+/**
  * Plans that include Nearby BookDrop device pairing — trusted devices whose
  * drops skip the per-transfer confirmation dialog: any paid plan (Plus, Pro,
  * and Lifetime `purchase`). Free users see the pairing affordance with a
@@ -184,6 +200,16 @@ export const isCustomizationAllowed = (plan: UserPlan, customizationPurchased: b
   isSelfHosted() || customizationPurchased || PREMIUM_PLANS.includes(plan);
 
 /**
+ * How many devices the account may sign in to sync on: three on the Free
+ * plan, or null for no limit, which is every other plan, any purchase and a
+ * self-hosted deployment.
+ */
+export const getDeviceLimit = (token: string): number | null =>
+  isSelfHosted() || getUserProfilePlan(token) !== 'free' || getCustomizationPurchased(token)
+    ? null
+    : FREE_PLAN_DEVICE_LIMIT;
+
+/**
  * Custom translators (the user's own OpenAI-compatible LLM or DeepL key) are a
  * premium feature. Requests go straight from the device, so this is a
  * client-side gate, like the TTS cache. It reads the session token directly so
@@ -193,6 +219,13 @@ export const isCustomTranslatorAllowed = (token: string | null | undefined): boo
   token
     ? isCustomizationAllowed(getUserProfilePlan(token), getCustomizationPurchased(token))
     : isSelfHosted();
+
+/**
+ * Custom TTS services (the user's own OpenAI-compatible speech endpoint) are
+ * premium on the same terms as custom translators: requests go straight from
+ * the device, so this is a client-side gate.
+ */
+export const isCustomTTSAllowed = isCustomTranslatorAllowed;
 
 export const STORAGE_QUOTA_GRACE_BYTES = 10 * 1024 * 1024; // 10 MB grace
 
@@ -221,6 +254,25 @@ export const getTranslationQuota = (plan: UserPlan): number => {
   return (
     fixedQuota || DEFAULT_DAILY_TRANSLATION_QUOTA[plan] || DEFAULT_DAILY_TRANSLATION_QUOTA['free']
   );
+};
+
+/**
+ * Plans that include the self-hosted premium TTS engine ("Readest Voice"):
+ * Plus and Pro subscriptions only. Unlike EMAIL_IN_PLANS / CLOUD_SYNC_PLANS
+ * this deliberately excludes `purchase` (lifetime): synthesis has a recurring
+ * per-character GPU cost that a one-time purchase does not fund.
+ */
+export const TTS_PLANS: readonly UserPlan[] = ['plus', 'pro'];
+
+export const isTTSInPlan = (plan: UserPlan): boolean => TTS_PLANS.includes(plan);
+
+/** A Readest Voice tier: Plus unlocks its voices, Pro unlocks both tiers. */
+export const isVoiceTierInPlan = (tier: 'plus' | 'pro', plan: UserPlan): boolean =>
+  tier === 'plus' ? isTTSInPlan(plan) : plan === 'pro';
+
+export const getTTSQuota = (plan: UserPlan): number => {
+  const fixedQuota = parseInt(process.env['TTS_FIXED_QUOTA'] ?? '0');
+  return fixedQuota || DEFAULT_DAILY_TTS_QUOTA[plan] || 0;
 };
 
 export const getTranslationPlanData = (token: string) => {
@@ -258,6 +310,15 @@ export const getAccessToken = async (): Promise<string | null> => {
   return data?.session?.access_token ?? null;
 };
 
+/**
+ * The token of the account the app shows as signed in, for the plan claims of
+ * client-side premium gates (the same token `useAuth()` hands the translator
+ * popup). AuthContext keeps it through offline spells and login-server
+ * outages, while {@link getAccessToken} returns null once the session expires
+ * and can't refresh (#7827). It may be expired, so never send it to a server.
+ */
+export const getSignedInToken = (): string | null => localStorage.getItem('token');
+
 export const getUserID = async (): Promise<string | null> => {
   if (isWebAppPlatform()) {
     const user = localStorage.getItem('user') ?? '{}';
@@ -271,11 +332,17 @@ export const validateUserAndToken = async (authHeader: string | null | undefined
   if (!authHeader) return {};
 
   const token = authHeader.replace('Bearer ', '');
-  const {
-    data: { user },
-    error,
-  } = await supabase.auth.getUser(token);
-
-  if (error || !user) return {};
-  return { user, token };
+  // getClaims verifies asymmetric (ES256) tokens locally against the cached JWKS, so API
+  // routes skip a GET /auth/v1/user round trip per request. HS256 tokens (legacy secret,
+  // self-hosted) still fall back to getUser inside getClaims.
+  try {
+    const { data, error } = await supabase.auth.getClaims(token);
+    const claims = data?.claims;
+    // The anon and service-role keys are JWTs too.
+    if (error || claims?.role !== 'authenticated' || !claims.sub) return {};
+    return { user: { id: claims.sub, email: claims.email }, token };
+  } catch {
+    // getClaims throws, rather than returns, an error for expired tokens.
+    return {};
+  }
 };

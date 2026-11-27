@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Google Play Real-Time Developer Notifications (RTDN) webhook handler. The
@@ -109,6 +110,16 @@ function createSupabaseMock(state: {
                 captures.paymentUpdates.push(obj);
                 return Promise.resolve({ data: null, error: null });
               },
+            }),
+          };
+        case 'gift_cards':
+          return {
+            select: () => ({
+              eq: () => ({ eq: () => Promise.resolve({ data: [], error: null }) }),
+            }),
+            // A refund revokes the gift its payment bought; none here.
+            update: () => ({
+              eq: () => ({ select: () => Promise.resolve({ data: [], error: null }) }),
             }),
           };
         default:

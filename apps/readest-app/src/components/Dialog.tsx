@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import React, { ReactNode, useEffect, useRef, useState } from 'react';
+import React, { ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { OverlayScrollbarsComponent } from 'overlayscrollbars-react';
 import 'overlayscrollbars/overlayscrollbars.css';
 import { MdArrowBackIosNew, MdArrowForwardIos } from 'react-icons/md';
@@ -23,6 +23,29 @@ const SNAP_THRESHOLD = 0.2;
 const SWIPE_DISMISS_THRESHOLD = 8;
 // How long the modal takes to fade and scale away once `isOpen` goes false.
 const CLOSE_TRANSITION_MS = 300;
+
+// Elements that can take Tab focus; `tabIndex`, layout and visibility filter
+// the rest (`visibility: hidden` keeps a layout box but can't take focus).
+const TABBABLE =
+  'a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), ' +
+  'textarea:not(:disabled), iframe, summary, [contenteditable], [tabindex]';
+
+const getTabbables = (root: HTMLElement) =>
+  Array.from(root.querySelectorAll<HTMLElement>(TABBABLE)).filter(
+    (el) =>
+      el.tabIndex >= 0 &&
+      el.getClientRects().length > 0 &&
+      getComputedStyle(el).visibility !== 'hidden',
+  );
+
+const isSameRadioGroup = (a: Element, b: Element) =>
+  a instanceof HTMLInputElement &&
+  b instanceof HTMLInputElement &&
+  a.type === 'radio' &&
+  b.type === 'radio' &&
+  !!a.name &&
+  a.name === b.name &&
+  a.form === b.form;
 
 interface DialogProps {
   id?: string;
@@ -53,6 +76,8 @@ interface DialogProps {
    */
   aboveKeyboard?: boolean;
   onClose: () => void;
+  /** A sub-page's way back: the mobile back arrow, Escape and Android Back. Defaults to onClose. */
+  onBack?: () => void;
 }
 
 // Scrollable content owns the whole gesture, including at its edges where
@@ -91,12 +116,16 @@ const Dialog: React.FC<DialogProps> = ({
   useOverlayScroll = false,
   aboveKeyboard = false,
   onClose,
+  onBack,
 }) => {
   const _ = useTranslation();
   const { appService } = useEnv();
   const { systemUIVisible, statusBarHeight, safeAreaInsets, isIPhoneDuo } = useThemeStore();
   const { acquireBackKeyInterception, releaseBackKeyInterception } = useDeviceControlStore();
   const [isFullHeightInMobile, setIsFullHeightInMobile] = useState(!snapHeight);
+  // A mobile sheet sized by its content (a confirmation) rests at the bottom,
+  // short of the screen's top, like a snapped one.
+  const [isContentHeightSheet, setIsContentHeightSheet] = useState(false);
   const [isRtl] = useState(() => getDirFromUILanguage() === 'rtl');
   const dialogRef = useRef<HTMLDialogElement>(null);
   // Where the finger sits relative to the sheet's top edge, so the sheet slides
@@ -105,6 +134,11 @@ const Dialog: React.FC<DialogProps> = ({
   const dragOffsetRef = useRef(0);
   const pendingSwipeRef = useRef<{ x: number; y: number } | null>(null);
   const previousActiveElementRef = useRef<HTMLElement | null>(null);
+  // Set while a Tab that started inside the dialog moves focus.
+  const tabFromInsideRef = useRef<'forward' | 'back' | null>(null);
+  // The key listeners below are bound once per open, so they read the latest onBack here.
+  const onBackRef = useRef(onBack);
+  onBackRef.current = onBack;
   const iconSize22 = useResponsiveSize(22);
   const isMobile = window.innerWidth < 640 || window.innerHeight < 640;
   const [keyboardInset, setKeyboardInset] = useState(0);
@@ -159,17 +193,76 @@ const Dialog: React.FC<DialogProps> = ({
     return () => clearTimeout(timer);
   }, [isOpen]);
 
+  useLayoutEffect(() => {
+    const dialog = dialogRef.current;
+    const box = dialog?.querySelector<HTMLElement>('.modal-box');
+    if (!isOpen || !isMobile || fullScreen || snapHeight || !dialog || !box) {
+      setIsContentHeightSheet(false);
+      return;
+    }
+    setIsContentHeightSheet(box.offsetHeight < dialog.clientHeight);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, fullScreen, snapHeight]);
+
+  // Only a sheet covering the screen clears the status bar and offers a back
+  // button; a shorter one is dismissed by its handle, backdrop or own actions.
+  const isFullHeightSheet = !isContentHeightSheet && (fullScreen || isFullHeightInMobile);
+
+  const focusEnd = (dialog: HTMLElement, last: boolean) => {
+    const tabbables = getTabbables(dialog);
+    (tabbables[last ? tabbables.length - 1 : 0] ?? dialog).focus();
+  };
+
+  // `<dialog open>` without showModal() leaves the page behind it focusable, so
+  // Tab would walk out to it (#8007). When nothing focusable lies ahead inside
+  // the dialog, wrap to its other end. Only a Tab that starts inside acts: a
+  // layer above the dialog (a ModalPortal, a toast) keeps its own focus.
+  const keepTabInside = (event: KeyboardEvent) => {
+    const dialog = dialogRef.current;
+    const active = document.activeElement;
+    if (!dialog || !active || !dialog.contains(active)) return;
+    const ahead = event.shiftKey
+      ? Node.DOCUMENT_POSITION_PRECEDING
+      : Node.DOCUMENT_POSITION_FOLLOWING;
+    // The rest of a radio group isn't a Tab stop: Tab leaves the group.
+    const hasNext = getTabbables(dialog).some(
+      (el) =>
+        el !== active &&
+        !isSameRadioGroup(el, active) &&
+        active.compareDocumentPosition(el) & ahead,
+    );
+    if (!hasNext) {
+      event.preventDefault();
+      focusEnd(dialog, event.shiftKey);
+      return;
+    }
+    // Engines differ on Tab stops (macOS WebKit stops only on text fields by
+    // default), so watch where this Tab lands and bring it back if it left.
+    tabFromInsideRef.current = event.shiftKey ? 'back' : 'forward';
+    setTimeout(() => (tabFromInsideRef.current = null));
+  };
+
+  const handleFocusIn = (event: FocusEvent) => {
+    const dialog = dialogRef.current;
+    const direction = tabFromInsideRef.current;
+    if (!dialog || !direction || dialog.contains(event.target as Node)) return;
+    tabFromInsideRef.current = null;
+    focusEnd(dialog, direction === 'back');
+  };
+
   const handleKeyDown = (event: KeyboardEvent | CustomEvent) => {
     // A nested confirmation owns dismissal until it closes.
     if (dialogRef.current?.querySelector('dialog[open]')) return false;
     if (event instanceof CustomEvent) {
       if (event.detail.keyName === 'Back') {
-        onClose();
+        (onBackRef.current ?? onClose)();
         return true;
       }
     } else {
       if (event.key === 'Escape') {
-        onClose();
+        (onBackRef.current ?? onClose)();
+      } else if (event.key === 'Tab') {
+        keepTabInside(event);
       }
       event.stopPropagation();
     }
@@ -189,6 +282,7 @@ const Dialog: React.FC<DialogProps> = ({
 
     setIsFullHeightInMobile(!snapHeight && isMobile);
     window.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('focusin', handleFocusIn);
     if (dialogRef.current) {
       dialogRef.current.addEventListener('keydown', handleKeyDown);
     }
@@ -209,6 +303,7 @@ const Dialog: React.FC<DialogProps> = ({
     return () => {
       clearTimeout(timer);
       window.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('focusin', handleFocusIn);
       if (appService?.isAndroidApp) {
         releaseBackKeyInterception();
         eventDispatcher.offSync('native-key-down', handleKeyDown);
@@ -400,7 +495,7 @@ const Dialog: React.FC<DialogProps> = ({
         )}
         style={{
           paddingTop:
-            appService?.hasSafeAreaInset && (fullScreen || isFullHeightInMobile)
+            appService?.hasSafeAreaInset && isFullHeightSheet
               ? `${Math.max(safeAreaInsets?.top || 0, systemUIVisible ? statusBarHeight : 0)}px`
               : '0px',
           paddingBottom:
@@ -439,13 +534,14 @@ const Dialog: React.FC<DialogProps> = ({
           ) : (
             <div className='flex h-11 w-full items-center justify-between'>
               <button
-                aria-label={_('Close')}
+                aria-label={onBack ? _('Back') : _('Close')}
                 aria-hidden={!isOpen}
-                onClick={onClose}
+                onClick={onBack ?? onClose}
                 disabled={!dismissible}
-                className={
-                  'btn btn-ghost btn-circle flex h-8 min-h-8 w-8 hover:bg-transparent focus:outline-hidden disabled:bg-transparent sm:hidden'
-                }
+                className={clsx(
+                  'btn btn-ghost btn-circle h-8 min-h-8 w-8 hover:bg-transparent focus:outline-hidden disabled:bg-transparent sm:hidden',
+                  isFullHeightSheet ? 'flex' : 'hidden',
+                )}
               >
                 {isRtl ? (
                   <MdArrowForwardIos size={iconSize22} />
@@ -462,7 +558,7 @@ const Dialog: React.FC<DialogProps> = ({
                 onClick={onClose}
                 disabled={!dismissible}
                 className={
-                  'bg-base-300/65 btn btn-ghost btn-circle ml-auto hidden h-6 min-h-6 w-6 focus:outline-hidden sm:flex'
+                  'bg-base-300/65 eink:bg-transparent btn btn-ghost btn-circle ml-auto hidden h-6 min-h-6 w-6 focus:outline-hidden sm:flex'
                 }
               >
                 <svg

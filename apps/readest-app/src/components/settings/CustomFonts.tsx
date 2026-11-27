@@ -1,17 +1,24 @@
 import clsx from 'clsx';
-import React, { useState } from 'react';
-import { MdAdd, MdDelete } from 'react-icons/md';
+import React, { useRef, useState } from 'react';
+import { MdAdd, MdDelete, MdOutlineCloudDownload } from 'react-icons/md';
 import { IoMdCloseCircleOutline } from 'react-icons/io';
 import { useEnv } from '@/context/EnvContext';
 import { useReaderStore } from '@/store/readerStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useCustomFontStore } from '@/store/customFontStore';
+import { useTransferStore } from '@/store/transferStore';
 import { useFileSelector } from '@/hooks/useFileSelector';
 import { saveViewSettings } from '@/helpers/settings';
 import { CustomFont, mountCustomFont } from '@/styles/fonts';
-import { queueReplicaBinaryUpload } from '@/services/sync/replicaBinaryUpload';
+import {
+  queueReplicaBinaryDownload,
+  queueReplicaBinaryUpload,
+} from '@/services/sync/replicaBinaryUpload';
+import { runFileFontDownload } from '@/services/sync/file/runLibrarySync';
+import { eventDispatcher } from '@/utils/event';
 import { Tips } from './primitives';
+import { useSettingsSubPageBack } from './settingsSubPageBack';
 
 interface CustomFontsProps {
   bookKey: string;
@@ -26,6 +33,9 @@ type FontFamily = {
 const CustomFonts: React.FC<CustomFontsProps> = ({ bookKey, onBack }) => {
   const _ = useTranslation();
   const { appService, envConfig } = useEnv();
+  // Escape and Android Back take the breadcrumb's way out, back to the Font
+  // panel, instead of closing Settings (this page has no SubPageHeader).
+  useSettingsSubPageBack(onBack);
   const { settings } = useSettingsStore();
   const {
     fonts: customFonts,
@@ -36,11 +46,18 @@ const CustomFonts: React.FC<CustomFontsProps> = ({ bookKey, onBack }) => {
     saveCustomFonts,
   } = useCustomFontStore();
   const { getViewSettings } = useReaderStore();
+  const { getReplicaTransfer } = useTransferStore();
   const viewSettings = getViewSettings(bookKey) || settings.globalViewSettings;
   const [isDeleteMode, setIsDeleteMode] = useState(false);
   // null = idle, true = importing (spinner), { family } = done importing (show font name).
   // The card stays mounted throughout — only its content changes.
   const [importingFont, setImportingFont] = useState<true | { family: string } | null>(null);
+  // A file sync backend downloads in place, outside the transfer queue: the
+  // spinner belongs to the pick that started the download.
+  const [fileDownload, setFileDownload] = useState<{ family: string; selection: number } | null>(
+    null,
+  );
+  const latestSelection = useRef(0);
 
   const { selectFiles } = useFileSelector(appService, _);
 
@@ -73,6 +90,10 @@ const CustomFonts: React.FC<CustomFontsProps> = ({ bookKey, onBack }) => {
             bundleDir: fontInfo.bundleDir,
             byteSize: fontInfo.byteSize,
           });
+          // Save before the next await: a sync pull reloads the store from
+          // settings, and one can land mid-import (closing the picker
+          // focuses the window), dropping fonts not saved yet (#7671).
+          saveCustomFonts(envConfig);
           console.log('Added custom font:', customFont);
           if (customFont && !customFont.error) {
             const loadedFont = await loadFont(envConfig, customFont.id);
@@ -80,7 +101,6 @@ const CustomFonts: React.FC<CustomFontsProps> = ({ bookKey, onBack }) => {
             if (appService) void queueReplicaBinaryUpload('font', customFont, appService);
           }
         }
-        saveCustomFonts(envConfig);
       } finally {
         // Keep the card visible — it now shows the font family name.
         // availableFamilies will pick it up on next render and the
@@ -106,7 +126,35 @@ const CustomFonts: React.FC<CustomFontsProps> = ({ bookKey, onBack }) => {
     }
   };
 
-  const handleSelectFamily = (family: FontFamily) => {
+  const isFamilyDownloading = (family: FontFamily) =>
+    fileDownload?.family === family.name ||
+    family.fonts.some((f) => f.contentId && getReplicaTransfer('font', f.contentId, 'download'));
+
+  const handleSelectFamily = async (family: FontFamily) => {
+    // Synced fonts download on demand: fetch every missing weight of the
+    // family, then select it — the download handler mounts the faces. A file
+    // sync backend goes first (#7793): a font that came through one may not be
+    // in Readest Cloud, while queuing a Readest Cloud download can't tell.
+    const cloudFonts = family.fonts.filter((f) => f.unavailable);
+    const selection = ++latestSelection.current;
+    if (cloudFonts.length > 0) {
+      setFileDownload({ family: family.name, selection });
+      const queued = await Promise.all(
+        cloudFonts.map(
+          async (font) =>
+            (await runFileFontDownload(envConfig, font)) ||
+            (await queueReplicaBinaryDownload('font', font)) ||
+            // Listed before its backend's Sync Custom Fonts was turned off (#7965).
+            (await runFileFontDownload(envConfig, font, true)),
+        ),
+      ).finally(() => setFileDownload((shown) => (shown?.selection === selection ? null : shown)));
+      if (!queued.some(Boolean)) {
+        eventDispatcher.dispatch('toast', { type: 'error', message: _('Download failed') });
+        return;
+      }
+      // A family picked while this one downloaded keeps the selection.
+      if (selection !== latestSelection.current) return;
+    }
     if (currentDefaultFont === 'serif') {
       saveViewSettings(envConfig, bookKey, 'serifFont', family.name);
     } else {
@@ -245,43 +293,62 @@ const CustomFonts: React.FC<CustomFontsProps> = ({ bookKey, onBack }) => {
           </div>
         )}
 
-        {availableFamilies.map((family) => (
-          <div
-            role='none'
-            key={family.name}
-            className={clsx(
-              'card h-12 border shadow-xs',
-              currentFontFamily === family.name
-                ? // eink-bordered: bg-primary/50 dodges the eink normalizer, so
-                  // without it the selected card is black-on-black (#4454).
-                  'border-primary/50 bg-primary/50 eink-bordered'
-                : `border-base-200 bg-base-100 ${isDeleteMode ? '' : 'cursor-pointer'}`,
-            )}
-            onClick={!isDeleteMode ? () => handleSelectFamily(family) : undefined}
-            title={family.fonts.map((f) => f.name).join('\n')}
-          >
-            <div className='card-body flex items-center justify-center p-2'>
-              <div
-                style={{
-                  fontFamily: `"${family.name}", sans-serif`,
-                  fontWeight: 400,
-                }}
-                className='text-base-content line-clamp-1 break-all'
-              >
-                {family.name}
-              </div>
-              {isDeleteMode && (
-                <button
-                  onClick={() => handleDeleteFamily(family)}
-                  className='btn btn-ghost btn-xs absolute right-[-10px] top-[-10px] h-6 min-h-0 w-6 p-0 hover:bg-transparent'
-                  title={_('Delete Font')}
-                >
-                  <IoMdCloseCircleOutline className='text-base-content/75 h-6 w-6' />
-                </button>
+        {availableFamilies.map((family) => {
+          const isCloudOnly = family.fonts.some((f) => f.unavailable);
+          const isDownloading = isCloudOnly && isFamilyDownloading(family);
+          return (
+            <div
+              role='none'
+              key={family.name}
+              className={clsx(
+                'card h-12 border shadow-xs',
+                currentFontFamily === family.name
+                  ? // eink-bordered: bg-primary/50 dodges the eink normalizer, so
+                    // without it the selected card is black-on-black (#4454).
+                    'border-primary/50 bg-primary/50 eink-bordered'
+                  : `border-base-200 bg-base-100 ${isDeleteMode ? '' : 'cursor-pointer'}`,
               )}
+              onClick={!isDeleteMode ? () => handleSelectFamily(family) : undefined}
+              title={family.fonts.map((f) => f.name).join('\n')}
+            >
+              <div className='card-body flex flex-row items-center justify-center gap-2 p-2'>
+                {isDownloading ? (
+                  <span
+                    role='status'
+                    aria-label={_('Downloading…')}
+                    className='loading loading-spinner loading-xs text-base-content/60 shrink-0'
+                  />
+                ) : (
+                  isCloudOnly && (
+                    <MdOutlineCloudDownload
+                      role='img'
+                      aria-label={_('Download from Cloud')}
+                      className='text-base-content/60 h-4 w-4 shrink-0'
+                    />
+                  )
+                )}
+                <div
+                  style={{
+                    fontFamily: `"${family.name}", sans-serif`,
+                    fontWeight: 400,
+                  }}
+                  className='text-base-content line-clamp-1 break-all'
+                >
+                  {family.name}
+                </div>
+                {isDeleteMode && (
+                  <button
+                    onClick={() => handleDeleteFamily(family)}
+                    className='btn btn-ghost btn-xs absolute right-[-10px] top-[-10px] h-6 min-h-0 w-6 p-0 hover:bg-transparent'
+                    title={_('Delete Font')}
+                  >
+                    <IoMdCloseCircleOutline className='text-base-content/75 h-6 w-6' />
+                  </button>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       <Tips className='mt-6'>

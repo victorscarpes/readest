@@ -49,10 +49,7 @@ const renderGrid = (userPlan: UserPlan = 'free') =>
     </div>,
   );
 
-const cards = () =>
-  Array.from(document.querySelectorAll('div.bg-base-100.rounded-lg')).filter((el) =>
-    el.className.includes('h-full'),
-  ) as HTMLElement[];
+const cards = () => Array.from(document.querySelectorAll('[data-plan-card]')) as HTMLElement[];
 
 afterEach(() => cleanup());
 
@@ -106,6 +103,38 @@ describe('plans grid layout', () => {
     expect(tops[0]).toBe(tops[1]);
   });
 
+  // Safari 16 resolved a percentage height on these grid items against the
+  // wrong box, so overflow-hidden clipped each card to a fraction of the
+  // viewport (#7181). Chromium lays that out correctly, so check the resolved
+  // height is auto: the card is sized by the row's stretch, which every
+  // engine gets right.
+  it('sizes cards by the grid row, not a percentage height', async () => {
+    await page.viewport(768, 1024);
+    renderGrid();
+
+    expect(cards()).toHaveLength(4);
+    for (const card of cards()) {
+      expect(card.computedStyleMap().get('height')?.toString()).toBe('auto');
+    }
+  });
+
+  it('makes every card tall enough for its content', async () => {
+    for (const [width, height] of [
+      [390, 844],
+      [768, 1024],
+      [1024, 768],
+    ] as const) {
+      await page.viewport(width, height);
+      renderGrid();
+
+      expect(cards()).toHaveLength(4);
+      for (const card of cards()) {
+        expect(card.clientHeight).toBeGreaterThanOrEqual(card.scrollHeight);
+      }
+      cleanup();
+    }
+  });
+
   it('drops to a single column on a phone', async () => {
     await page.viewport(390, 844);
     renderGrid();
@@ -132,5 +161,20 @@ describe('plans grid layout', () => {
     expect(Math.round(monthly!.getBoundingClientRect().top)).toBe(
       Math.round(yearly!.getBoundingClientRect().top),
     );
+  });
+});
+
+// Review (CodeRabbit): e-ink keeps text at full ink (DESIGN.md); the theme's
+// e-ink rules flatten colours, not opacity, so the tile prices must not fade.
+describe('On-Demand Purchase prices on e-ink', () => {
+  afterEach(() => document.documentElement.removeAttribute('data-eink'));
+
+  it('draws the prices at full opacity on e-ink, softened elsewhere', () => {
+    renderGrid();
+    const price = () => screen.getByText('$1.99');
+    expect(Number(getComputedStyle(price()).opacity)).toBeLessThan(1);
+
+    document.documentElement.setAttribute('data-eink', 'true');
+    expect(getComputedStyle(price()).opacity).toBe('1');
   });
 });

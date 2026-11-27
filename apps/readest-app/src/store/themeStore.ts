@@ -15,11 +15,20 @@ import {
   resolveThemeIsDarkMode,
 } from '@/utils/ambientLight';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { CustomTheme, Palette, ThemeMode, ThemeScope } from '@/styles/themes';
+import {
+  CustomTheme,
+  customThemeToTheme,
+  getDefaultThemeColor,
+  Palette,
+  ThemeMode,
+  ThemeScope,
+  themes,
+} from '@/styles/themes';
 import { EnvConfigType, isWebAppPlatform } from '@/services/environment';
 import { SystemSettings } from '@/types/settings';
+import type { DuoFoldState } from '@/utils/bridge';
 import { Insets } from '@/types/misc';
-import { StatusBarHiddenInsets } from '@/utils/insets';
+import { RecordedScreenInsets, RecordedScreenInsetsBySize } from '@/utils/insets';
 
 declare global {
   interface Window {
@@ -61,14 +70,19 @@ interface ThemeState {
   statusBarHeight: number;
   systemUIAlwaysHidden: boolean;
   safeAreaInsets: Insets | null;
-  // iPhone Duo: side insets seen with the status bar hidden; the reading page
-  // keeps them while the toolbar shows the status bar (see getReadingScreenInsets).
-  statusBarHiddenInsets: StatusBarHiddenInsets | null;
+  // iPhone Duo: top and side insets seen with the status bar hidden, per window
+  // size; the reading page keeps them while the toolbar shows the status bar
+  // (see getReadingScreenInsets).
+  statusBarHiddenInsets: RecordedScreenInsetsBySize | null;
+  // The same while the status bar shows, for the toolbars that show with it.
+  statusBarShownInsets: RecordedScreenInsetsBySize | null;
   // Radius (px) of the rounded bottom screen corners, 0 when unknown.
   screenCornerRadius: number;
   // iPhone Duo, whose vertical status strip is a large left/right inset (#6307).
   // Every horizontal-inset rule is gated on it, so no other device changes.
   isIPhoneDuo: boolean;
+  // iPhone Duo hinge status and folding region, null elsewhere.
+  duoFold: DuoFoldState | null;
   isRoundedWindow: boolean;
   setSystemUIAlwaysHidden: (hidden: boolean) => void;
   setStatusBarHeight: (height: number) => void;
@@ -82,7 +96,8 @@ interface ThemeState {
   setScopedThemeColor: (scope: ThemeScope, color: string) => void;
   getScopedTheme: (scope: ThemeScope) => { themeMode: ThemeMode; themeColor: string };
   resetThemeScopes: () => void;
-  updateAppTheme: (color: keyof Palette) => void;
+  /** Paints the browser chrome in `color`; with no argument, re-resolves the last one. */
+  updateAppTheme: (color?: keyof Palette) => void;
   saveCustomTheme: (
     envConfig: EnvConfigType,
     settings: SystemSettings,
@@ -93,9 +108,26 @@ interface ThemeState {
   handleAmbientLightChange: (lux: number) => void;
   updateSafeAreaInsets: (insets: Insets) => void;
   recordStatusBarHiddenInsets: (insets: Insets) => void;
+  recordStatusBarShownInsets: (insets: Insets) => void;
   updateScreenCornerRadius: (radius: number) => void;
   setIsIPhoneDuo: (isIPhoneDuo: boolean) => void;
+  setDuoFold: (fold: DuoFoldState | null) => void;
 }
+
+// The records with this window size's set to these insets, or null when it
+// already holds them. Each size keeps its own, so turning the device back
+// finds the one taken there before.
+const recordScreenInsets = (
+  records: RecordedScreenInsetsBySize | null,
+  { top, left, right }: Insets,
+): RecordedScreenInsetsBySize | null => {
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+  const key = `${width}x${height}`;
+  const prev: RecordedScreenInsets | undefined = records?.[key];
+  if (prev && prev.top === top && prev.left === left && prev.right === right) return null;
+  return { ...records, [key]: { width, height, top, left, right } };
+};
 
 const LIBRARY_THEME_MODE_KEY = 'libraryThemeMode';
 const LIBRARY_THEME_COLOR_KEY = 'libraryThemeColor';
@@ -110,8 +142,7 @@ const getInitialThemeMode = (): ThemeMode => {
 
 const getInitialThemeColor = (): string => {
   if (typeof window !== 'undefined' && localStorage) {
-    const defaultColor = window.__READEST_IS_EINK ? 'contrast' : 'default';
-    return localStorage.getItem('themeColor') || defaultColor;
+    return localStorage.getItem('themeColor') || getDefaultThemeColor();
   }
   return 'default';
 };
@@ -143,6 +174,30 @@ const persistAmbientIsDarkMode = (isDark: boolean) => {
     localStorage.setItem('ambientIsDarkMode', isDark ? 'true' : 'false');
   }
 };
+
+const resolveThemePalette = (themeColor: string, isDarkMode: boolean): Palette => {
+  let matched = themes.find((theme) => theme.name === themeColor);
+  if (!matched && typeof window !== 'undefined' && window.localStorage) {
+    try {
+      const customThemes = JSON.parse(
+        window.localStorage.getItem('customThemes') || '[]',
+      ) as CustomTheme[];
+      const custom = customThemes.find((theme) => theme.name === themeColor);
+      if (custom) {
+        matched = customThemeToTheme(custom);
+      }
+    } catch {
+      // Ignore malformed customThemes in storage
+    }
+  }
+  const resolved = matched ?? themes[0]!;
+  return isDarkMode ? resolved.colors.dark : resolved.colors.light;
+};
+
+// The palette key the page chrome last asked for: the route's background, or an
+// open sidebar's or notebook's. A theme change re-resolves this key in the new
+// palette instead of resetting it to the route's.
+let appThemeColorKey: keyof Palette = 'base-100';
 
 const applyDataTheme = (themeColor: string, isDarkMode: boolean) => {
   document.documentElement.setAttribute(
@@ -309,8 +364,10 @@ export const useThemeStore = create<ThemeState>((set, get) => {
     systemUIAlwaysHidden: false,
     safeAreaInsets: { top: 0, right: 0, bottom: 0, left: 0 },
     statusBarHiddenInsets: null,
+    statusBarShownInsets: null,
     screenCornerRadius: 0,
     isIPhoneDuo: false,
+    duoFold: null,
     isRoundedWindow: true,
     showSystemUI: () => set({ systemUIVisible: true }),
     dismissSystemUI: () => set({ systemUIVisible: false }),
@@ -381,26 +438,31 @@ export const useThemeStore = create<ThemeState>((set, get) => {
       );
       syncAmbientLightSubscription(activeMode);
     },
-    updateAppTheme: (color) => {
-      if (isWebAppPlatform()) {
-        const { palette } = get().themeCode;
-        document.querySelector('meta[name="theme-color"]')?.setAttribute('content', palette[color]);
+    updateAppTheme: (color = appThemeColorKey) => {
+      appThemeColorKey = color;
+      if (!isWebAppPlatform() || typeof document === 'undefined') return;
+      const { themeColor, isDarkMode } = get();
+      const resolved = resolveThemePalette(themeColor, isDarkMode)[color];
+      if (!resolved) return;
+      let meta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+      if (!meta) {
+        meta = document.createElement('meta');
+        meta.name = 'theme-color';
+        document.head.appendChild(meta);
       }
+      meta.setAttribute('content', resolved);
+      document.documentElement.style.backgroundColor = resolved;
     },
     saveCustomTheme: async (envConfig, settings, theme, isDelete) => {
-      const customThemes = settings.globalReadSettings.customThemes || [];
-      const index = customThemes.findIndex((t) => t.name === theme.name);
-      if (isDelete) {
-        if (index > -1) {
-          customThemes.splice(index, 1);
-        }
-      } else {
-        if (index > -1) {
-          customThemes[index] = theme;
-        } else {
-          customThemes.push(theme);
-        }
-      }
+      // A new list, not the one on screen changed in place: the footer Color
+      // panel memoizes on it and missed a new theme until a reload (#7716).
+      const current = settings.globalReadSettings.customThemes || [];
+      const exists = current.some((t) => t.name === theme.name);
+      const customThemes = isDelete
+        ? current.filter((t) => t.name !== theme.name)
+        : exists
+          ? current.map((t) => (t.name === theme.name ? theme : t))
+          : [...current, theme];
       settings.globalReadSettings.customThemes = customThemes;
       localStorage.setItem('customThemes', JSON.stringify(customThemes));
       const appService = await envConfig.getAppService();
@@ -423,26 +485,24 @@ export const useThemeStore = create<ThemeState>((set, get) => {
     updateSafeAreaInsets: (insets) => {
       set({ safeAreaInsets: insets });
     },
-    recordStatusBarHiddenInsets: ({ left, right }) => {
-      const width = window.innerWidth;
-      const height = window.innerHeight;
-      const prev = get().statusBarHiddenInsets;
-      if (
-        prev &&
-        prev.width === width &&
-        prev.height === height &&
-        prev.left === left &&
-        prev.right === right
-      ) {
-        return;
-      }
-      set({ statusBarHiddenInsets: { width, height, left, right } });
+    recordStatusBarHiddenInsets: (insets) => {
+      const record = recordScreenInsets(get().statusBarHiddenInsets, insets);
+      if (record) set({ statusBarHiddenInsets: record });
+    },
+    recordStatusBarShownInsets: (insets) => {
+      const record = recordScreenInsets(get().statusBarShownInsets, insets);
+      if (record) set({ statusBarShownInsets: record });
     },
     updateScreenCornerRadius: (radius) => {
       if (get().screenCornerRadius !== radius) set({ screenCornerRadius: radius });
     },
     setIsIPhoneDuo: (isIPhoneDuo) => {
       if (get().isIPhoneDuo !== isIPhoneDuo) set({ isIPhoneDuo });
+    },
+    setDuoFold: (fold) => {
+      // Refetched on every resize and focus: keep the reference while nothing
+      // changed so the reader does not re-lay out the page.
+      if (JSON.stringify(get().duoFold) !== JSON.stringify(fold)) set({ duoFold: fold });
     },
   };
 });

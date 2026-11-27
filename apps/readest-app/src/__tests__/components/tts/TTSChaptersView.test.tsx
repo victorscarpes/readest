@@ -1,3 +1,4 @@
+// @vitest-environment happy-dom
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 
@@ -124,6 +125,19 @@ describe('TTSChaptersView', () => {
     expect(screen.getByText('Download failed')).toBeTruthy();
     fireEvent.click(screen.getByLabelText('Resume download: Chapter Two'));
     expect(downloads.downloadChapter).toHaveBeenCalledWith(chapters[1]);
+  });
+
+  test('a chapter that ran out of daily quota says so', () => {
+    const item = { ...makeItem('b', 'failed'), error: 'DAILY_QUOTA_EXCEEDED' };
+    render(
+      <TTSChaptersView
+        downloads={makeDownloads(withItems([item]))}
+        activeSectionIndex={null}
+        isEink={false}
+      />,
+    );
+    expect(screen.getByText('Quota Exceeded')).toBeTruthy();
+    expect(screen.queryByText('Download failed')).toBeNull();
   });
 
   test('download all skips when every chapter is complete', () => {

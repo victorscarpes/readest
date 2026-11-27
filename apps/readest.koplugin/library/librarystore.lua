@@ -233,11 +233,11 @@ end
 -- ---------------------------------------------------------------------------
 -- upsertBook
 -- ---------------------------------------------------------------------------
--- Merges a row by (user_id, hash). Flags `cloud_present` and `local_present`
--- are OR-merged with the existing row UNLESS the caller passes the
--- `_force_cloud_present` sentinel, in which case the supplied value is
--- written verbatim (used for cloud-tombstone updates that must clear the
--- flag).
+-- Merges a row by (user_id, hash). `cloud_present` is OR-merged with the
+-- existing row UNLESS the caller passes the `_force_cloud_present` sentinel,
+-- in which case the supplied value is written verbatim (used for
+-- cloud-tombstone updates that must clear the flag). `local_present` is
+-- written as given (0 = the file is gone) and kept when left out.
 --
 -- Sentinels:
 --   _force_cloud_present = true → caller's cloud_present overrides OR-merge.
@@ -268,10 +268,12 @@ function M:upsertBook(row)
         else
             merged.cloud_present = tonumber(row.cloud_present) or 0
         end
-        -- OR-merge local_present always (no use case for force-clearing yet)
-        merged.local_present = math.max(
-            tonumber(existing.local_present) or 0,
-            tonumber(merged.local_present) or 0)
+        -- local_present is the caller's when it gives one: every caller that
+        -- passes 0 has found the file gone (lightScan's stale sweep,
+        -- removeLocalFile), and the row must turn cloud-only again (#7577).
+        -- Callers that don't know, such as a cloud pull, leave it out.
+        merged.local_present = tonumber(row.local_present)
+            or tonumber(existing.local_present) or 0
         -- Preserve fields the caller didn't provide
         for k in pairs(BOOK_COL_INDEX) do
             if merged[k] == nil and existing[k] ~= nil then
@@ -762,45 +764,7 @@ local DUMMY_HASH = "00000000000000000000000000000000"
 --   2026-02-01T00:00:00+0000
 --   2026-02-01T00:00:00.123456+00:00   (with fractional seconds)
 --   2026-02-01 00:00:00+00:00          (Postgres without the T separator)
-local function iso_to_ms(s)
-    if not s then return nil end
-    if type(s) == "number" then return s end
-    if type(s) ~= "string" then return nil end
-
-    local y, mo, d, h, mi, sec, frac, tz = s:match(
-        "^(%d%d%d%d)%-(%d%d)%-(%d%d)[T ](%d%d):(%d%d):(%d%d)([%.%d]*)(.*)$")
-    if not y then return nil end
-
-    local t = os.time({
-        year = tonumber(y), month = tonumber(mo), day = tonumber(d),
-        hour = tonumber(h), min  = tonumber(mi), sec  = tonumber(sec),
-        isdst = false,
-    })
-    -- os.time interprets the struct as LOCAL time; convert to UTC by
-    -- subtracting the local TZ offset.
-    local utc_offset = os.difftime(t, os.time(os.date("!*t", t)))
-    t = t + utc_offset
-
-    -- Apply the input's own offset (Z = +00:00; "+05:30" subtracts 5.5h to
-    -- get UTC). Default to UTC if no offset present (server contract).
-    if tz and tz ~= "" and tz ~= "Z" then
-        local sign, oh, om = tz:match("^([%+%-])(%d%d):?(%d%d)$")
-        if sign then
-            local off = (tonumber(oh) * 3600) + (tonumber(om or 0) * 60)
-            if sign == "+" then t = t - off else t = t + off end
-        end
-    end
-
-    local ms = t * 1000
-    if frac and frac:sub(1, 1) == "." then
-        -- Fractional seconds: take only the first 3 digits (ms precision)
-        local f = frac:sub(2, 4)
-        if #f > 0 then
-            ms = ms + tonumber(f .. string.rep("0", 3 - #f))
-        end
-    end
-    return ms
-end
+local iso_to_ms = require("readest_synctime")
 
 function M.parseSyncRow(dbRow)
     if not dbRow then return nil end

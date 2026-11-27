@@ -11,6 +11,8 @@ interface StatusInfoProps {
   isVertical?: boolean;
   isEink?: boolean;
   className?: string;
+  /** A custom header/footer text color is set: the percentage inherits it. */
+  inheritTextColor?: boolean;
   /** Backdrop for the scrolled-mode pill; see ProgressBar. */
   style?: React.CSSProperties;
 }
@@ -23,6 +25,7 @@ const StatusInfo: React.FC<StatusInfoProps> = ({
   isVertical,
   isEink,
   className,
+  inheritTextColor,
   style,
 }) => {
   const formattedTime = useCurrentTime(showTime, use24Hour);
@@ -31,19 +34,24 @@ const StatusInfo: React.FC<StatusInfoProps> = ({
   if (!showTime && !showBattery) return null;
 
   const fillWidth = ((batteryLevel ?? 0) / 100) * 21;
-  // The fill rect starts at x=0.5 of the 25px-wide icon.
-  const fillClipRight = (25 - 0.5 - fillWidth).toFixed(2);
-  const renderPercentage = (colorClass: string) => (
-    <span
+  // Drawn in the icon's own coordinates: the baseline sits half of Inter's cap
+  // height (0.7275em) below the body's middle (y 6), so the digits center on
+  // the body whatever ascent and descent the engine reads. A line box centered
+  // in the icon followed those metrics, up to a pixel high in CEF on Linux.
+  const renderPercentage = (colorClass?: string) => (
+    <text
+      x='11'
+      y='8.9'
+      textAnchor='middle'
+      fill='currentColor'
       className={clsx(
-        'battery-percentage absolute text-[8px] font-medium leading-none',
+        'battery-percentage text-[8px] font-medium',
         colorClass,
         isVertical && '[writing-mode:horizontal-tb]',
       )}
-      style={{ left: '11px', transform: 'translateX(-50%)' }}
     >
       {batteryLevel}
-    </span>
+    </text>
   );
 
   return (
@@ -88,21 +96,20 @@ const StatusInfo: React.FC<StatusInfoProps> = ({
               fill='currentColor'
               opacity={isEink ? 1.0 : 0.75}
             />
+            {/* The fill behind the number is currentColor at 30% opacity -- a
+                mid tone in any theme, which themed text reads against. In eink
+                the fill is opaque base-content but covers only the charged
+                part, so a page-colored copy clipped to the fill (the nested
+                svg ends where the fill does) is knocked out of it while the
+                rest of the number stays base-content. */}
+            {showBatteryPercentage &&
+              renderPercentage(inheritTextColor && !isEink ? undefined : 'text-base-content')}
+            {showBatteryPercentage && isEink && (
+              <svg width={(0.5 + fillWidth).toFixed(2)} height='12' overflow='hidden'>
+                {renderPercentage('text-base-100')}
+              </svg>
+            )}
           </svg>
-          {/* The fill behind the number is currentColor at 30% opacity -- a
-              mid tone in any theme, which themed text reads against. In eink
-              the fill is opaque base-content but covers only the charged part,
-              so a page-colored copy clipped to the fill is knocked out of it
-              while the rest of the number stays base-content. */}
-          {showBatteryPercentage && renderPercentage('text-base-content')}
-          {showBatteryPercentage && isEink && (
-            <span
-              className='absolute inset-0 flex items-center justify-center'
-              style={{ clipPath: `inset(0px ${fillClipRight}px 0px 0px)` }}
-            >
-              {renderPercentage('text-base-100')}
-            </span>
-          )}
         </span>
       )}
     </div>

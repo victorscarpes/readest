@@ -45,6 +45,22 @@ describe('applyScrollableStyle', () => {
     expect(wrappers).toHaveLength(2);
   });
 
+  it('leaves the hidden placeholders of a chunked section unwrapped', () => {
+    // A placeholder stands in for a table rendered in another chunk
+    // (foliate-js section-chunks.js); a wrapper around it would be a visible,
+    // empty block, and a blank page at the end of a chunk.
+    document.body.innerHTML = `
+      <div>
+        <table data-foliate-chunk="2"></table>
+        <table><tr><td>Cell</td></tr></table>
+      </div>
+    `;
+    applyScrollableStyle(document);
+    const placeholder = document.querySelector('table[data-foliate-chunk]')!;
+    expect(placeholder.parentElement!.classList.contains(SCROLL_WRAPPER_CLASS)).toBe(false);
+    expect(document.querySelectorAll(`.${SCROLL_WRAPPER_CLASS}`)).toHaveLength(1);
+  });
+
   it('does not double-wrap when applyScrollableStyle runs twice', () => {
     document.body.innerHTML = `
       <div>
@@ -424,7 +440,7 @@ describe('findScrollableBox', () => {
 
 describe('applyTableTouchScroll', () => {
   it('attaches capture-phase touch and wheel listeners once per document', () => {
-    document.documentElement.removeAttribute('data-readest-table-touch-scroll');
+    document.documentElement.removeAttribute('data-readest-scroll-wrapper-touch-scroll');
     const addSpy = vi.spyOn(document, 'addEventListener');
     applyTableTouchScroll(document);
     applyTableTouchScroll(document);
@@ -435,5 +451,108 @@ describe('applyTableTouchScroll', () => {
     expect(wheels).toHaveLength(1);
     expect(wheels[0]?.[2]).toEqual({ capture: true, passive: true });
     addSpy.mockRestore();
+  });
+
+  const makeTable = ({ direction = 'ltr', height = 200, paginated = true } = {}) => {
+    const wrapper = document.createElement('div');
+    wrapper.className = SCROLL_WRAPPER_CLASS;
+    wrapper.innerHTML = '<table><tr><td>Content</td></tr></table>';
+    wrapper.style.setProperty('--available-height', '200');
+    wrapper.style.direction = direction;
+    Object.defineProperties(wrapper, {
+      clientWidth: { value: 200 },
+      scrollWidth: { value: 400 },
+      clientHeight: { value: height },
+      scrollHeight: { value: 400 },
+    });
+    vi.spyOn(wrapper, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 200, height));
+    document.body.classList.toggle('paginated-mode', paginated);
+    document.body.appendChild(wrapper);
+    applyTableTouchScroll(document);
+    return wrapper;
+  };
+
+  const sendTouch = (target: HTMLElement, type: string, screenX = 0, screenY = 0) => {
+    const touch = { screenX, screenY };
+    target.dispatchEvent(
+      Object.assign(new Event(type, { bubbles: true, cancelable: true }), {
+        changedTouches: [touch],
+        touches: type === 'touchend' ? [] : [touch],
+      }),
+    );
+  };
+
+  afterEach(() => {
+    document.body.classList.remove('paginated-mode');
+    document.body.querySelectorAll(`.${SCROLL_WRAPPER_CLASS}`).forEach((el) => el.remove());
+  });
+
+  it.each([
+    { direction: 'ltr', scrollLeft: 200, dx: -40 },
+    { direction: 'ltr', scrollLeft: 0, dx: 40 },
+    { direction: 'rtl', scrollLeft: -200, dx: 40 },
+    { direction: 'rtl', scrollLeft: 0, dx: -40 },
+  ])('forwards an outward swipe at the $direction table edge $scrollLeft', (testCase) => {
+    const wrapper = makeTable(testCase);
+    wrapper.scrollLeft = testCase.scrollLeft;
+    const pageTurn = vi.fn();
+    wrapper.addEventListener('touchmove', pageTurn);
+
+    sendTouch(wrapper, 'touchstart');
+    sendTouch(wrapper, 'touchmove', testCase.dx);
+    sendTouch(wrapper, 'touchend');
+
+    expect(pageTurn).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the table gesture when it reaches an edge and forwards only a new outward swipe', () => {
+    const wrapper = makeTable();
+    wrapper.scrollLeft = 120;
+    const pageTurn = vi.fn();
+    wrapper.addEventListener('touchmove', pageTurn);
+
+    sendTouch(wrapper, 'touchstart');
+    sendTouch(wrapper, 'touchmove', -20);
+    wrapper.scrollLeft = 200;
+    sendTouch(wrapper, 'touchmove', -90);
+    sendTouch(wrapper, 'touchend');
+    expect(pageTurn).not.toHaveBeenCalled();
+
+    sendTouch(wrapper, 'touchstart');
+    sendTouch(wrapper, 'touchmove', -20);
+    sendTouch(wrapper, 'touchend');
+    expect(pageTurn).toHaveBeenCalledOnce();
+  });
+
+  it('keeps an inward swipe in the table when the finger reverses at the edge', () => {
+    const wrapper = makeTable();
+    wrapper.scrollLeft = 200;
+    const pageTurn = vi.fn();
+    wrapper.addEventListener('touchmove', pageTurn);
+
+    sendTouch(wrapper, 'touchstart');
+    sendTouch(wrapper, 'touchmove', 20);
+    sendTouch(wrapper, 'touchmove', -40);
+    sendTouch(wrapper, 'touchend');
+
+    expect(pageTurn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: 'a short table', height: 150, dx: -40, dy: 0 },
+    { name: 'scrolled mode', paginated: false, dx: -40, dy: 0 },
+    { name: 'an inward swipe', dx: 40, dy: 0 },
+    { name: 'a vertical swipe', dx: 0, dy: -40 },
+  ])('keeps the gesture inside the table for $name', ({ dx, dy, ...options }) => {
+    const wrapper = makeTable(options);
+    wrapper.scrollLeft = 200;
+    const pageTurn = vi.fn();
+    wrapper.addEventListener('touchmove', pageTurn);
+
+    sendTouch(wrapper, 'touchstart');
+    sendTouch(wrapper, 'touchmove', dx, dy);
+    sendTouch(wrapper, 'touchend');
+
+    expect(pageTurn).not.toHaveBeenCalled();
   });
 });

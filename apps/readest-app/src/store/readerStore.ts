@@ -13,6 +13,7 @@ import { Insets } from '@/types/misc';
 import { EnvConfigType } from '@/services/environment';
 import { FoliateView } from '@/types/view';
 import { isAbsEbook } from '@/utils/audiobook';
+import { partialMD5 } from '@/utils/md5';
 import { DocumentLoader, TOCItem } from '@/libs/document';
 import {
   isPseStreamFileName,
@@ -23,7 +24,12 @@ import type { FileSystem } from '@/types/system';
 import { isFeedBookUrl, parseFeedBookUrl } from '@/services/rss/feedBookUrl';
 import { openFeedBookDoc } from '@/services/rss/feedReader';
 import { computeBookNav, hydrateBookNav, isBookNavCacheCurrent, updateToc } from '@/services/nav';
-import { formatTitle, getMetadataHash, getPrimaryLanguage } from '@/utils/book';
+import {
+  formatTitle,
+  getMetadataHash,
+  getPrimaryLanguage,
+  parseSeriesPosition,
+} from '@/utils/book';
 import { getBaseFilename } from '@/utils/path';
 import { SUPPORTED_LANGNAMES } from '@/services/constants';
 import { useSettingsStore } from './settingsStore';
@@ -50,6 +56,8 @@ interface ViewState {
   /* True while an Auto Scroll session (#4998) is engaged for this view;
      session-only, never persisted. Drives the View menu checkmark. */
   autoScrollEnabled: boolean;
+  /* True while drawing mode is on for this view; session-only. */
+  drawingEnabled: boolean;
   syncing: boolean;
   gridInsets: Insets | null;
   /* True while the reader is showing a position requested by an external
@@ -78,6 +86,7 @@ interface ReaderStore {
   setBottomBarTab: (tab: string) => void;
   setBookmarkRibbonVisibility: (key: string, visible: boolean) => void;
   setTTSEnabled: (key: string, enabled: boolean) => void;
+  setDrawingEnabled: (key: string, enabled: boolean) => void;
   setAutoScrollEnabled: (key: string, enabled: boolean) => void;
   setIsLoading: (key: string, loading: boolean) => void;
   setIsSyncing: (key: string, syncing: boolean) => void;
@@ -115,6 +124,27 @@ interface ReaderStore {
   setViewInited: (key: string, inited: boolean) => void;
   setPreviewMode: (key: string, previewMode: boolean) => void;
   recreateViewer: (envConfig: EnvConfigType, key: string) => void;
+}
+
+/** `state` with `patch` applied to `key`'s view state: unchanged (so no subscriber is notified)
+ * when every field already holds its value. Insets compare by value. */
+function withViewState(
+  state: ReaderStore,
+  key: string,
+  patch: Partial<ViewState>,
+): ReaderStore | Partial<ReaderStore> {
+  const current = state.viewStates[key];
+  const same = (a: unknown, b: unknown) =>
+    a === b ||
+    (!!a &&
+      !!b &&
+      typeof a === 'object' &&
+      typeof b === 'object' &&
+      Object.keys(a).length === Object.keys(b).length &&
+      Object.entries(a).every(([k, v]) => (b as Record<string, unknown>)[k] === v));
+  if (current && Object.entries(patch).every(([k, v]) => same(current[k as keyof ViewState], v)))
+    return state;
+  return { viewStates: { ...state.viewStates, [key]: { ...current!, ...patch } } };
 }
 
 export const useReaderStore = create<ReaderStore>((set, get) => ({
@@ -192,6 +222,7 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
           ribbonVisible: false,
           ttsEnabled: false,
           autoScrollEnabled: false,
+          drawingEnabled: false,
           syncing: false,
           gridInsets: null,
           previewMode: false,
@@ -213,6 +244,7 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
       const isPseStream = !!book.url && isPseStreamFileName(book.url);
       const isFeed = !!book.url && isFeedBookUrl(book.url);
       let bookDoc = bookData?.bookDoc;
+      let docFormat = bookData?.docFormat;
       let file: File | null = bookData?.file ?? null;
       // Per-book config and the third-party annotation module are pure IO
       // with no dependency on the document load. Kick them off here so their
@@ -265,8 +297,23 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
             widePages: makeWidePages(config),
           }).open();
           bookDoc = doc.book;
+          docFormat = doc.format;
           if (doc.format === 'CBZ') config.widePages = getWidePages(bookDoc.sections);
         }
+      }
+      // KOReader keys a book by its file's partial MD5, but an Audiobookshelf
+      // ebook's hash comes from its abs:// path: keep the file's own id with
+      // the book for KOReader Sync (#7088). Hashed on every open, since the
+      // server can replace an item's file, and waited for only briefly: a
+      // stalled range read must not keep the book from opening.
+      if (file && isAbsEbook(book)) {
+        const hashing = partialMD5(file).then(
+          (hash) => {
+            book.metadata!.absFileHash = hash;
+          },
+          (err) => console.warn('Failed to hash the Audiobookshelf ebook', err),
+        );
+        await Promise.race([hashing, new Promise((resolve) => setTimeout(resolve, 5000))]);
       }
       const config = await configPromise;
       // Import annotations from third-party readers on first open. The
@@ -291,17 +338,20 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
       // Filter out invalid booknotes
       config.booknotes = config.booknotes?.filter((booknote) => booknote.cfi) ?? [];
       // Load cached book navigation (TOC + section fragments) or compute and persist.
+      // Feed manifests grow between opens, so feed books always recompute instead.
       if (book.format === 'EPUB' && bookDoc.rendition?.layout !== 'pre-paginated') {
-        const cachedNav = await appService.loadBookNav(book);
+        const cachedNav = isFeed ? null : await appService.loadBookNav(book);
         if (isBookNavCacheCurrent(cachedNav) && process.env.NODE_ENV === 'production') {
           hydrateBookNav(bookDoc, cachedNav);
         } else {
           const freshNav = await computeBookNav(bookDoc);
           hydrateBookNav(bookDoc, freshNav);
-          try {
-            await appService.saveBookNav(book, freshNav);
-          } catch (e) {
-            console.warn('Failed to persist book nav cache:', e);
+          if (!isFeed) {
+            try {
+              await appService.saveBookNav(book, freshNav);
+            } catch (e) {
+              console.warn('Failed to persist book nav cache:', e);
+            }
           }
         }
       }
@@ -332,7 +382,7 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
         if (series) {
           book.metadata.series = book.metadata.series ?? formatTitle(series.name);
           book.metadata.seriesIndex =
-            book.metadata.seriesIndex ?? parseFloat(series.position || '0');
+            book.metadata.seriesIndex ?? parseSeriesPosition(series.position);
           book.metadata.seriesTotal =
             book.metadata.seriesTotal ?? (series.total ? parseInt(series.total, 10) : undefined);
         }
@@ -347,7 +397,7 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
 
       const isFixedLayout =
         bookDoc.rendition?.layout === 'pre-paginated' || FIXED_LAYOUT_FORMATS.has(book.format);
-      const newBookData: BookData = { id, book, file, config, bookDoc, isFixedLayout };
+      const newBookData: BookData = { id, book, file, config, bookDoc, docFormat, isFixedLayout };
       useBookDataStore.setState((state) => ({
         booksData: {
           ...state.booksData,
@@ -371,6 +421,7 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
             ribbonVisible: false,
             ttsEnabled: false,
             autoScrollEnabled: false,
+            drawingEnabled: false,
             syncing: false,
             gridInsets: null,
             previewMode: false,
@@ -395,6 +446,7 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
             ribbonVisible: false,
             ttsEnabled: false,
             autoScrollEnabled: false,
+            drawingEnabled: false,
             syncing: false,
             gridInsets: null,
             previewMode: false,
@@ -421,7 +473,12 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
             config: {
               ...bookData.config,
               updatedAt: Date.now(),
-              viewSettings,
+              // The sidebar tab is written to the book config only, so keep
+              // it rather than the live copy's stale value (#6836).
+              viewSettings: {
+                ...viewSettings,
+                sideBarTab: bookData.config?.viewSettings?.sideBarTab ?? viewSettings.sideBarTab,
+              },
             },
           },
         },
@@ -521,94 +578,33 @@ export const useReaderStore = create<ReaderStore>((set, get) => ({
     } as BookProgress);
   },
   setBookmarkRibbonVisibility: (key: string, visible: boolean) =>
-    set((state) => ({
-      viewStates: {
-        ...state.viewStates,
-        [key]: {
-          ...state.viewStates[key]!,
-          ribbonVisible: visible,
-        },
-      },
-    })),
+    set((state) => withViewState(state, key, { ribbonVisible: visible })),
 
   setTTSEnabled: (key: string, enabled: boolean) =>
-    set((state) => ({
-      viewStates: {
-        ...state.viewStates,
-        [key]: {
-          ...state.viewStates[key]!,
-          ttsEnabled: enabled,
-        },
-      },
-    })),
+    set((state) => withViewState(state, key, { ttsEnabled: enabled })),
+
+  setDrawingEnabled: (key: string, enabled: boolean) =>
+    set((state) => withViewState(state, key, { drawingEnabled: enabled })),
 
   setAutoScrollEnabled: (key: string, enabled: boolean) =>
-    set((state) => ({
-      viewStates: {
-        ...state.viewStates,
-        [key]: {
-          ...state.viewStates[key]!,
-          autoScrollEnabled: enabled,
-        },
-      },
-    })),
+    set((state) => withViewState(state, key, { autoScrollEnabled: enabled })),
 
   setIsLoading: (key: string, loading: boolean) =>
-    set((state) => ({
-      viewStates: {
-        ...state.viewStates,
-        [key]: {
-          ...state.viewStates[key]!,
-          loading,
-        },
-      },
-    })),
+    set((state) => withViewState(state, key, { loading: loading })),
 
   setIsSyncing: (key: string, syncing: boolean) =>
-    set((state) => ({
-      viewStates: {
-        ...state.viewStates,
-        [key]: {
-          ...state.viewStates[key]!,
-          syncing,
-        },
-      },
-    })),
+    set((state) => withViewState(state, key, { syncing: syncing })),
 
   getGridInsets: (key: string) =>
     get().viewStates[key]?.gridInsets || { top: 0, right: 0, bottom: 0, left: 0 },
   setGridInsets: (key: string, insets: Insets | null) =>
-    set((state) => ({
-      viewStates: {
-        ...state.viewStates,
-        [key]: {
-          ...state.viewStates[key]!,
-          gridInsets: insets,
-        },
-      },
-    })),
+    set((state) => withViewState(state, key, { gridInsets: insets })),
 
   setViewInited: (key: string, inited: boolean) =>
-    set((state) => ({
-      viewStates: {
-        ...state.viewStates,
-        [key]: {
-          ...state.viewStates[key]!,
-          inited,
-        },
-      },
-    })),
+    set((state) => withViewState(state, key, { inited: inited })),
 
   setPreviewMode: (key: string, previewMode: boolean) =>
-    set((state) => ({
-      viewStates: {
-        ...state.viewStates,
-        [key]: {
-          ...state.viewStates[key]!,
-          previewMode,
-        },
-      },
-    })),
+    set((state) => withViewState(state, key, { previewMode: previewMode })),
 
   recreateViewer: (envConfig: EnvConfigType, key: string) => {
     if (!key || get().viewStates[key]?.key !== key) return;

@@ -36,6 +36,7 @@ vi.mock('@/services/environment', () => ({
   isMacPlatform: () => false,
   getCommandPaletteShortcut: () => '',
   getAPIBaseUrl: () => 'https://web.readest.com/api',
+  getReadestVoiceAPIBaseUrl: () => 'https://web.readest.com/api',
   getNodeAPIBaseUrl: () => 'https://web.readest.com/api',
   getInitializedAppService: vi.fn(),
   default: {},
@@ -80,6 +81,10 @@ vi.mock('@/store/themeStore', () => ({
 
 vi.mock('@/store/settingsStore', () => ({
   useSettingsStore: () => ({ settings: {}, setSettings: vi.fn(), saveSettings: vi.fn() }),
+}));
+
+vi.mock('@/store/readerStore', () => ({
+  useReaderStore: { getState: () => ({ viewStates: {} }) },
 }));
 
 vi.mock('@/store/trafficLightStore', () => ({

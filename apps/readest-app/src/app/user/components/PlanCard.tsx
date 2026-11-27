@@ -3,6 +3,7 @@ import { IoCheckmark } from 'react-icons/io5';
 import { useTranslation } from '@/hooks/useTranslation';
 import { getLocale } from '@/utils/misc';
 import { getPlanAccent, PlanDetails } from '../utils/plan';
+import { GiftPrice } from '@/types/gift';
 import { PlanInterval, PlanType } from '@/types/quota';
 import PlanActionButton from './PlanActionButton';
 import PurchaseCallToActions from './PurchaseCallToActions';
@@ -14,9 +15,14 @@ interface PlanCardProps {
   recommended?: boolean;
   upgradable?: boolean;
   canSwitchInterval?: boolean;
+  giftUntil?: string;
+  giftOnly?: boolean;
+  belowGift?: boolean;
   /** Defaults to false: an unknown state shows the buy button, never hides it. */
   customizationPurchased?: boolean;
+  giftPrices?: GiftPrice[];
   onSubscribe: (priceId?: string, planType?: PlanType) => void;
+  onGiftCard?: () => void;
 }
 
 const PlanCard: React.FC<PlanCardProps> = ({
@@ -27,7 +33,12 @@ const PlanCard: React.FC<PlanCardProps> = ({
   customizationPurchased = false,
   upgradable,
   canSwitchInterval,
+  giftUntil,
+  giftOnly,
+  belowGift,
+  giftPrices,
   onSubscribe,
+  onGiftCard,
 }) => {
   const _ = useTranslation();
   const { price, currency } = plan;
@@ -50,8 +61,12 @@ const PlanCard: React.FC<PlanCardProps> = ({
 
   return (
     <div
+      // No h-full: grid items already stretch to their row. Safari 16 resolved
+      // the percentage against the wrong height, and overflow-hidden then
+      // clipped every card to it (#7181).
+      data-plan-card
       className={clsx(
-        'bg-base-100 eink-bordered flex h-full flex-col overflow-hidden rounded-lg border',
+        'bg-base-100 eink-bordered flex flex-col overflow-hidden rounded-lg border',
         // The emphasised border marks the plan you are actually on, in that
         // tier's own colour — "recommended" is not a state the reader is in.
         isUserPlan ? accent.border : 'border-base-200',
@@ -125,7 +140,7 @@ const PlanCard: React.FC<PlanCardProps> = ({
                   <div key={key} className='flex justify-between gap-2 text-xs'>
                     <span className={plan.hintColor}>{_(key)}</span>
                     <span className='text-base-content shrink-0 font-medium whitespace-nowrap'>
-                      {value}
+                      {typeof value === 'string' ? _(value) : value}
                     </span>
                   </div>
                 ))}
@@ -138,7 +153,9 @@ const PlanCard: React.FC<PlanCardProps> = ({
               plan={plan}
               accent={accent}
               customizationPurchased={customizationPurchased}
+              giftPrices={giftPrices}
               onSubscribe={onSubscribe}
+              onGiftCard={onGiftCard}
             />
           ) : (
             <PlanActionButton
@@ -148,6 +165,9 @@ const PlanCard: React.FC<PlanCardProps> = ({
               canSwitchInterval={canSwitchInterval}
               upgradable={upgradable}
               isUserPlan={isUserPlan}
+              giftUntil={giftUntil}
+              giftOnly={giftOnly}
+              belowGift={belowGift}
               onSubscribe={onSubscribe}
             />
           )}

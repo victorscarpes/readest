@@ -1,3 +1,4 @@
+// @vitest-environment happy-dom
 import { describe, it, expect, vi } from 'vitest';
 import { render } from '@testing-library/react';
 import StatusInfo from '@/app/reader/components/StatusInfo';
@@ -53,7 +54,25 @@ describe('StatusInfo battery percentage legibility', () => {
     expect(base.classList.contains('text-base-content')).toBe(true);
     expect(knockout.textContent).toBe('35');
     expect(knockout.classList.contains('text-base-100')).toBe(true);
-    // Fill ends at 0.5 + 21 * 0.35 = 7.85px of the 25px icon.
-    expect(knockout.parentElement?.style.clipPath).toBe('inset(0px 17.15px 0px 0px)');
+    // Fill ends at 0.5 + 21 * 0.35 = 7.85px of the 25px icon; the copy's
+    // nested svg ends there too, clipping it to the fill.
+    expect(knockout.parentElement?.getAttribute('width')).toBe('7.85');
+    expect(knockout.parentElement?.getAttribute('overflow')).toBe('hidden');
+  });
+});
+
+describe('StatusInfo battery percentage with a custom footer color (#6794)', () => {
+  it('inherits the footer color instead of the theme text color', () => {
+    batteryLevel = 90;
+    const { container } = render(
+      <div style={{ color: '#806000' }}>
+        <StatusInfo {...baseProps} isEink={false} inheritTextColor />
+      </div>,
+    );
+    const percentage = container.querySelector('.battery-percentage') as HTMLElement;
+
+    expect(percentage.textContent).toBe('90');
+    expect(percentage.classList.contains('text-base-content')).toBe(false);
+    expect(percentage.style.color).toBe('');
   });
 });

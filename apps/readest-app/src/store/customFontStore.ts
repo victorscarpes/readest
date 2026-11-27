@@ -10,6 +10,7 @@ import {
 import { useSettingsStore } from './settingsStore';
 import { getReplicaPersistEnv } from '@/services/sync/replicaPersist';
 import { publishReplicaDelete, publishReplicaUpsert } from '@/services/sync/replicaPublish';
+import { queueReplicaBinaryDelete } from '@/services/sync/replicaBinaryUpload';
 import { FONT_KIND } from '@/services/sync/adapters/font';
 import { computeFontContentId } from '@/services/fontService';
 import { migrateLegacyReplicas } from '@/services/sync/migrateLegacy';
@@ -19,8 +20,10 @@ const publishFontUpsert = (font: CustomFont): void => {
   void publishReplicaUpsert(FONT_KIND, font, font.contentId, font.reincarnation);
 };
 
-const publishFontDelete = (contentId: string): void => {
-  void publishReplicaDelete(FONT_KIND, contentId);
+const publishFontDelete = (font: CustomFont): void => {
+  if (!font.contentId) return;
+  void publishReplicaDelete(FONT_KIND, font.contentId);
+  void queueReplicaBinaryDelete(FONT_KIND, font);
 };
 
 interface FontStoreState {
@@ -44,8 +47,11 @@ interface FontStoreState {
    * handler clears the flag on completion.
    */
   applyRemoteFont: (font: CustomFont) => void;
-  /** Soft-delete by contentId, skipping the publish call. */
-  softDeleteByContentId: (contentId: string) => void;
+  /**
+   * Soft-delete by contentId, skipping the publish call. `deletedAt` keeps a
+   * peer's delete time, so a later re-import still wins over it.
+   */
+  softDeleteByContentId: (contentId: string, deletedAt?: number) => void;
   /** Clear the placeholder unavailable flag once binaries land on disk. */
   markAvailableByContentId: (contentId: string) => void;
   /**
@@ -154,7 +160,7 @@ export const useCustomFontStore = create<FontStoreState>((set, get) => ({
     set((state) => ({
       fonts: [...state.fonts],
     }));
-    if (font.contentId) publishFontDelete(font.contentId);
+    publishFontDelete(font);
     return result;
   },
 
@@ -189,12 +195,12 @@ export const useCustomFontStore = create<FontStoreState>((set, get) => ({
     if (env) void get().saveCustomFonts(env);
   },
 
-  softDeleteByContentId: (contentId) => {
+  softDeleteByContentId: (contentId, deletedAt = Date.now()) => {
     const target = get().fonts.find((f) => f.contentId === contentId && !f.deletedAt);
     if (!target) return;
     set((state) => ({
       fonts: state.fonts.map((f) =>
-        f.id === target.id ? { ...f, deletedAt: Date.now(), blobUrl: undefined, loaded: false } : f,
+        f.id === target.id ? { ...f, deletedAt, blobUrl: undefined, loaded: false } : f,
       ),
     }));
     if (target.blobUrl) URL.revokeObjectURL(target.blobUrl);
@@ -316,8 +322,10 @@ export const useCustomFontStore = create<FontStoreState>((set, get) => ({
   },
 
   loadAllFonts: async (envConfig) => {
+    // Cloud-only fonts have no file on disk until the user downloads them.
     const fontIds = get()
       .getAvailableFonts()
+      .filter((font) => !font.unavailable)
       .map((font) => font.id);
     return await get().loadFonts(envConfig, fontIds);
   },
