@@ -1,0 +1,5 @@
+# Emscripten build output (see packages/acj-wasm/build.sh). Committed so the app
+# needs no C/wasm toolchain. Marked generated so GitHub collapses the diff; kept
+# LF so bundlers/Node read it identically on every checkout.
+vendor/acj.js linguist-generated=true
+vendor/acj.js text eol=lf

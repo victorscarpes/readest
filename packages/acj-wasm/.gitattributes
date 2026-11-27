@@ -1,0 +1,3 @@
+# The build script runs in a Linux container — it must stay LF regardless of
+# the checkout's core.autocrlf.
+*.sh text eol=lf
